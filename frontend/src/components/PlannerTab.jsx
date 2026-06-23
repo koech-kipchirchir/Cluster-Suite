@@ -1,5 +1,9 @@
 import React, { useState, useEffect } from "react";
-import api, { setAuthToken } from "../api";
+import api, { setAuthToken, userApi, taskApi } from "../api";
+import { formatCurrency } from "../utils/uiHelpers";
+import AccountManager from "./AccountManager";
+import DepositModal from "./DepositModal";
+import OtpModal from "./OtpModal";
 
 const parseFloatSafe = (value) => {
   const parsed = parseFloat(value);
@@ -52,6 +56,13 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
   const [highlightedTaskId, setHighlightedTaskId] = useState(null);
   const [importingTasks, setImportingTasks] = useState(false);
   const [templates, setTemplates] = useState([]);
+  const [currency, setCurrency] = useState("KES");
+  const [accounts, setAccounts] = useState([]);
+  const [otpModalOpen, setOtpModalOpen] = useState(false);
+  const [otpContext, setOtpContext] = useState(null);
+  const [showAccountManager, setShowAccountManager] = useState(false);
+  const [depositModalOpen, setDepositModalOpen] = useState(false);
+  const [depositContext, setDepositContext] = useState(null);
   const [recommendations, setRecommendations] = useState([]);
   const [showRecommendations, setShowRecommendations] = useState(false);
   const [duplicatingEventId, setDuplicatingEventId] = useState(null);
@@ -102,6 +113,34 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
     loadWallets();
     loadTemplates();
     loadRecommendations();
+    const loadProfileCurrency = async () => {
+      try {
+        setTokenIfPresent();
+        const profileRes = await userApi.getProfile();
+        setCurrency(profileRes.data?.currency || "KES");
+      } catch (err) {
+        console.warn("Unable to load profile currency", err);
+      }
+    };
+    loadProfileCurrency();
+  }, []);
+
+  const handleOpenAccounts = () => setShowAccountManager(true);
+  const handleSaveAccounts = (list) => saveAccountsToStorage(list);
+
+  useEffect(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem('receive_accounts') || '[]');
+      if (!stored || stored.length === 0) {
+        localStorage.setItem('receive_accounts', JSON.stringify([]));
+        setAccounts([]);
+      } else {
+        setAccounts(stored);
+      }
+    } catch (e) {
+      localStorage.setItem('receive_accounts', JSON.stringify([]));
+      setAccounts([]);
+    }
   }, []);
 
   const loadTemplates = async () => {
@@ -243,7 +282,7 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
     }
   };
 
-  const updateWalletBalance = async (wallet, amountToAdd) => {
+  const updateWalletBalance = async (wallet, amountToAdd, accountName) => {
     const amount = parseFloatSafe(amountToAdd);
     if (!amount) return;
     const newBalance = parseFloatSafe(wallet.balance) + amount;
@@ -252,10 +291,12 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
     setWallets(prev => prev.map((w) => w.id === wallet.id ? { ...w, balance: newBalance } : w));
 
     try {
-      await api.put(`/planner/wallets/${wallet.id}`, {
-        ...wallet,
-        balance: newBalance,
-      });
+      const updatedWallet = { ...wallet, balance: newBalance };
+      if (accountName) {
+        const depositNote = `Deposit from ${accountName}: ${amount}`;
+        updatedWallet.notes = (wallet.notes ? wallet.notes + "\n" : "") + depositNote;
+      }
+      await api.put(`/planner/wallets/${wallet.id}`, updatedWallet);
       await loadEvents();
       await loadWallets();
     } catch (err) {
@@ -264,6 +305,41 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
       await loadWallets();
     } finally {
       setUpdatingWalletId(null);
+    }
+  };
+
+  const saveAccountsToStorage = (list) => {
+    localStorage.setItem('receive_accounts', JSON.stringify(list || []));
+    setAccounts(list || []);
+  };
+
+  const addReceiveAccount = (name) => {
+    if (!name || !name.trim()) return;
+    const list = [...accounts, { id: Date.now(), name: name.trim() }];
+    saveAccountsToStorage(list);
+  };
+
+  const handleDeposit = async (wallet, suggestedAmount) => {
+    setDepositContext({ wallet, amount: suggestedAmount || '' });
+    setDepositModalOpen(true);
+  };
+
+  const handleDepositSubmit = async ({ to, amount, saveAccount }) => {
+    if (saveAccount && to) {
+      const exists = accounts.some((acc) => acc.name === to);
+      if (!exists) {
+        saveAccountsToStorage([...accounts, { id: Date.now(), name: to.trim() }]);
+      }
+    }
+
+    try {
+      await api.post(`/planner/wallets/${depositContext.wallet.id}/stk-push`, { amount, phone: to });
+      setDepositModalOpen(false);
+      alert('M-Pesa STK push initiated. Please approve the transaction on your phone.');
+    } catch (err) {
+      console.error('Deposit failed', err);
+      const errorMessage = err.response?.data?.message || err.response?.data?.error || err.response?.data?.details || err.message || 'Failed to initiate M-Pesa STK push';
+      alert(`Failed to initiate M-Pesa STK push: ${errorMessage}`);
     }
   };
 
@@ -467,7 +543,7 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
     if (!lastImportedTaskIds.length) return alert('No tasks to undo.');
     try {
       setImportingTasks(true);
-      await api.taskApi.deleteMany(lastImportedTaskIds);
+      await taskApi.bulkDelete(lastImportedTaskIds);
       setLastImportedTaskIds([]);
       alert(`Deleted ${lastImportedTaskIds.length} imported tasks.`);
       loadEvents();
@@ -560,7 +636,7 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
           <div>
             <div style={{ fontSize: "14px", fontWeight: "600", opacity: 0.8, textTransform: "uppercase", letterSpacing: "1px" }}>Total Cluster Savings</div>
-            <div style={{ fontSize: "36px", fontWeight: "900" }}>${totalSaved.toLocaleString()}</div>
+            <div style={{ fontSize: "36px", fontWeight: "900" }}>{formatCurrency(totalSaved, currency)}</div>
           </div>
           <div style={{ textAlign: "right" }}>
             <div style={{ fontSize: "14px", fontWeight: "600", opacity: 0.8 }}>Overall Progress</div>
@@ -571,9 +647,41 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
           <div style={{ width: `${overallProgress}%`, height: "100%", background: "#10b981", transition: "width 0.5s ease-out" }} />
         </div>
         <div style={{ marginTop: "15px", fontSize: "14px", opacity: 0.9 }}>
-          You still need <strong>${(totalBudget - totalSaved).toLocaleString()}</strong> to reach all your goals.
+            You still need <strong>{formatCurrency(totalBudget - totalSaved, currency)}</strong> to reach all your goals.
+            <button onClick={handleOpenAccounts} style={{ marginLeft: 12, padding: '6px 10px', borderRadius: 8, background: '#e5e7eb', border: 'none', cursor: 'pointer' }}>Manage Accounts</button>
         </div>
       </div>
+      {showAccountManager && (
+        <AccountManager accounts={accounts} onSave={handleSaveAccounts} onClose={() => setShowAccountManager(false)} />
+      )}
+      {depositModalOpen && depositContext && (
+        <DepositModal
+          open={depositModalOpen}
+          walletName={depositContext.wallet.name}
+          currency={currency}
+          accounts={accounts}
+          initialAmount={depositContext.amount}
+          onClose={() => setDepositModalOpen(false)}
+          onSubmit={handleDepositSubmit}
+        />
+      )}
+      {otpModalOpen && otpContext && (
+        <OtpModal
+          open={otpModalOpen}
+          onClose={() => setOtpModalOpen(false)}
+          otpId={otpContext.otpId}
+          walletId={otpContext.walletId}
+          to={otpContext.to}
+          amount={otpContext.amount}
+          onConfirmed={async () => {
+            await loadWallets();
+            await loadEvents();
+            alert('Deposit completed');
+            setOtpModalOpen(false);
+            setOtpContext(null);
+          }}
+        />
+      )}
 
       {/* Upcoming events summary */}
       <div style={{ display: "flex", gap: "16px", marginBottom: "18px" }}>
@@ -613,7 +721,7 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
         </p>
         <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
           <input 
-            placeholder="e.g. Plan a 3-day camping trip to Yosemite next month with a budget of $200" 
+            placeholder={`e.g. Plan a 3-day camping trip to Yosemite next month with a budget of ${formatCurrency(200, currency)}`} 
             value={aiPrompt} 
             onChange={e => setAiPrompt(e.target.value)} 
             style={{ flex: 1, padding: "12px", borderRadius: "10px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }}
@@ -647,6 +755,8 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
             <button
               key={template.id}
               onClick={() => applyTemplate(template)}
+              onMouseEnter={(e) => e.currentTarget.style.borderColor = "#6366f1"}
+              onMouseLeave={(e) => e.currentTarget.style.borderColor = theme.border}
               style={{
                 padding: "16px",
                 borderRadius: "12px",
@@ -658,17 +768,16 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
                 transition: "all 0.2s",
                 fontSize: "14px"
               }}
-              onHover={(e) => e.target.style.borderColor = "#6366f1"}
             >
               <div style={{ fontSize: "20px", marginBottom: "8px" }}>{template.icon}</div>
               <div>{template.name}</div>
-              <div style={{ fontSize: "12px", color: theme.muted, marginTop: "4px" }}>${template.defaultBudget}</div>
+              <div style={{ fontSize: "12px", color: theme.muted, marginTop: "4px" }}>{formatCurrency(template.defaultBudget, currency)}</div>
             </button>
           ))}
         </div>
       </div>
 
-      <div style={{ background: theme.card, padding: "24px", borderRadius: "12px", border: `1px solid ${theme.border}`, marginBottom: "24px" }}>
+      <div id="create-event-form" style={{ background: theme.card, padding: "24px", borderRadius: "12px", border: `1px solid ${theme.border}`, marginBottom: "24px" }}>
         <h3 style={{ margin: "0 0 20px 0", color: theme.text, fontSize: "18px", fontWeight: "800" }}>Create New Event</h3>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "16px" }}>
           <input placeholder="Event Name" value={newEventForm.name} onChange={e => setNewEventForm({ ...newEventForm, name: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }} />
@@ -676,8 +785,8 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
           <select value={newEventForm.type} onChange={e => setNewEventForm({ ...newEventForm, type: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }}>
             {EVENT_TYPES.map(type => <option key={type} value={type}>{type}</option>)}
           </select>
-          <input type="number" placeholder="Budget Goal ($)" value={newEventForm.budget_goal} onChange={e => setNewEventForm({ ...newEventForm, budget_goal: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }} />
-          <input type="number" placeholder="Current Savings ($)" value={newEventForm.current_savings} onChange={e => setNewEventForm({ ...newEventForm, current_savings: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }} />
+          <input type="number" placeholder={`Budget Goal (${currency})`} value={newEventForm.budget_goal} onChange={e => setNewEventForm({ ...newEventForm, budget_goal: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }} />
+          <input type="number" placeholder={`Current Savings (${currency})`} value={newEventForm.current_savings} onChange={e => setNewEventForm({ ...newEventForm, current_savings: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }} />
           <div style={{ gridColumn: "span 2", display: "flex", alignItems: "center", gap: "8px", color: theme.text }}>
             <input type="checkbox" id="createWallet" checked={newEventForm.createWallet} onChange={e => setNewEventForm({ ...newEventForm, createWallet: e.target.checked })} />
             <label htmlFor="createWallet" style={{ fontSize: "14px", fontWeight: "600", cursor: "pointer" }}>Create a dedicated savings wallet for this event</label>
@@ -687,7 +796,7 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
         <button onClick={addEvent} style={{ marginTop: "16px", background: "#6366f1", color: "white", border: "none", padding: "10px 24px", borderRadius: "8px", fontWeight: "700", cursor: "pointer" }}>Add Event</button>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "16px", marginBottom: "22px" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "16px", marginBottom: "22px" }}>
         <input
           placeholder="Search events..."
           value={eventSearch}
@@ -703,17 +812,39 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
           <option value="progress">Sort by Progress</option>
           <option value="name">Sort by Name</option>
         </select>
+        <button
+          onClick={() => {
+            const el = document.getElementById("create-event-form");
+            if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+          }}
+          style={{
+            padding: "12px",
+            borderRadius: "12px",
+            background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
+            color: "white",
+            border: "none",
+            fontWeight: "700",
+            cursor: "pointer",
+            boxShadow: "0 4px 10px rgba(99, 102, 241, 0.2)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "6px"
+          }}
+        >
+          ➕ Add Event
+        </button>
       </div>
 
       <div style={{ marginBottom: "24px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "16px" }}>
           <div style={{ background: theme.card, padding: "20px", borderRadius: "18px", border: `1px solid ${theme.border}` }}>
             <div style={{ fontSize: "12px", color: theme.muted, fontWeight: "700", textTransform: "uppercase", marginBottom: "10px" }}>Wallet Balance</div>
-            <div style={{ fontSize: "28px", fontWeight: "900" }}>${wallets.reduce((sum, wallet) => sum + (wallet.balance || 0), 0).toLocaleString()}</div>
+            <div style={{ fontSize: "28px", fontWeight: "900" }}>{formatCurrency(wallets.reduce((sum, wallet) => sum + (wallet.balance || 0), 0), currency)}</div>
           </div>
           <div style={{ background: theme.card, padding: "20px", borderRadius: "18px", border: `1px solid ${theme.border}` }}>
             <div style={{ fontSize: "12px", color: theme.muted, fontWeight: "700", textTransform: "uppercase", marginBottom: "10px" }}>Target Goal</div>
-            <div style={{ fontSize: "28px", fontWeight: "900" }}>${wallets.reduce((sum, wallet) => sum + (wallet.target_amount || 0), 0).toLocaleString()}</div>
+            <div style={{ fontSize: "28px", fontWeight: "900" }}>{formatCurrency(wallets.reduce((sum, wallet) => sum + (wallet.target_amount || 0), 0), currency)}</div>
           </div>
           <div style={{ background: theme.card, padding: "20px", borderRadius: "18px", border: `1px solid ${theme.border}` }}>
             <div style={{ fontSize: "12px", color: theme.muted, fontWeight: "700", textTransform: "uppercase", marginBottom: "10px" }}>Goal Progress</div>
@@ -766,11 +897,11 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
                 <div style={{ marginBottom: "18px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px", fontSize: "13px", color: theme.muted }}>
                     <span>Balance</span>
-                    <span>${(wallet.balance || 0).toFixed(2)}</span>
+                    <span>{formatCurrency(wallet.balance || 0, currency)}</span>
                   </div>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px", fontSize: "13px", color: theme.muted }}>
                     <span>Target</span>
-                    <span>${(wallet.target_amount || 0).toFixed(2)}</span>
+                    <span>{formatCurrency(wallet.target_amount || 0, currency)}</span>
                   </div>
                   <div style={{ height: "10px", background: theme.border, borderRadius: "6px", overflow: "hidden" }}>
                     <div style={{ width: `${progress}%`, height: "100%", background: "#10b981", transition: "width 0.4s ease" }} />
@@ -778,8 +909,8 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
                 </div>
                 <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
                   {["10", "50", "100"].map((amt) => (
-                    <button key={amt} onClick={() => updateWalletBalance(wallet, amt)} style={{ flex: 1, padding: "10px", borderRadius: "10px", border: `1px solid ${theme.border}`, background: theme.card, color: theme.text, cursor: "pointer", fontWeight: "700" }}>
-                      +${amt}
+                    <button key={amt} onClick={() => handleDeposit(wallet, amt)} style={{ flex: 1, padding: "10px", borderRadius: "10px", border: `1px solid ${theme.border}`, background: theme.card, color: theme.text, cursor: "pointer", fontWeight: "700" }}>
+                      +{formatCurrency(Number(amt), currency)}
                     </button>
                   ))}
                 </div>
@@ -797,8 +928,8 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
           <select value={newWalletForm.type} onChange={e => setNewWalletForm({ ...newWalletForm, type: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }}>
             {WALLET_TYPES.map(type => <option key={type} value={type}>{type}</option>)}
           </select>
-          <input type="number" placeholder="Current Balance ($)" value={newWalletForm.balance} onChange={e => setNewWalletForm({ ...newWalletForm, balance: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }} />
-          <input type="number" placeholder="Target Amount ($)" value={newWalletForm.target_amount} onChange={e => setNewWalletForm({ ...newWalletForm, target_amount: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }} />
+          <input type="number" placeholder={`Current Balance (${currency})`} value={newWalletForm.balance} onChange={e => setNewWalletForm({ ...newWalletForm, balance: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }} />
+          <input type="number" placeholder={`Target Amount (${currency})`} value={newWalletForm.target_amount} onChange={e => setNewWalletForm({ ...newWalletForm, target_amount: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }} />
           <select value={newWalletForm.event_id} onChange={e => setNewWalletForm({ ...newWalletForm, event_id: e.target.value })} style={{ padding: "10px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.input, color: theme.text }}>
             <option value="">Link to Event (Optional)</option>
             {events.map((evt) => <option key={evt.id} value={evt.id}>{evt.name}</option>)}
@@ -814,8 +945,26 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
             Loading events...
           </div>
         ) : visibleEvents.length === 0 ? (
-          <div style={{ gridColumn: "1 / -1", padding: "40px", textAlign: "center", color: theme.muted, background: theme.card, borderRadius: "20px", border: `2px dashed ${theme.border}` }}>
-            No events yet. Start your next adventure!
+          <div style={{ gridColumn: "1 / -1", padding: "40px", textAlign: "center", color: theme.muted, background: theme.card, borderRadius: "20px", border: `2px dashed ${theme.border}`, display: "flex", flexDirection: "column", alignItems: "center", gap: "16px" }}>
+            <span>No events yet. Start your next adventure!</span>
+            <button
+              onClick={() => {
+                const el = document.getElementById("create-event-form");
+                if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+              }}
+              style={{
+                padding: "10px 20px",
+                borderRadius: "10px",
+                background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
+                color: "white",
+                border: "none",
+                fontWeight: "700",
+                cursor: "pointer",
+                boxShadow: "0 4px 10px rgba(99, 102, 241, 0.2)"
+              }}
+            >
+              ➕ Create Your First Event
+            </button>
           </div>
         ) : (
           visibleEvents.map((event) => {
@@ -868,7 +1017,7 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
                     {linkedWallets.map((w) => (
                       <div key={w.id} style={{ display: "flex", justifyContent: "space-between", fontSize: "13px", color: theme.text, marginBottom: "6px" }}>
                         <span style={{ fontWeight: "600" }}>{w.name} <span style={{ fontSize: "11px", color: theme.muted }}>({w.type})</span></span>
-                        <span style={{ fontWeight: "700" }}>${(w.balance || 0).toLocaleString()} / ${(w.target_amount || 0).toLocaleString()}</span>
+                        <span style={{ fontWeight: "700" }}>{formatCurrency(w.balance || 0, currency)} / {formatCurrency(w.target_amount || 0, currency)}</span>
                       </div>
                     ))}
                   </div>
@@ -892,11 +1041,11 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
                   <div style={{ fontSize: "11px", fontWeight: "700", color: "#6366f1", textTransform: "uppercase", marginBottom: "12px" }}>👛 Daily Savings Goal</div>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "end" }}>
                     <div>
-                      <div style={{ fontSize: "28px", fontWeight: "900", color: theme.text }}>${dailyTarget}</div>
+                      <div style={{ fontSize: "28px", fontWeight: "900", color: theme.text }}>{formatCurrency(dailyTarget, currency)}</div>
                       <div style={{ fontSize: "12px", color: theme.muted }}>needed every day</div>
                     </div>
                     <div style={{ textAlign: "right" }}>
-                      <div style={{ fontSize: "14px", fontWeight: "700", color: theme.text }}>${remainingAmount}</div>
+                      <div style={{ fontSize: "14px", fontWeight: "700", color: theme.text }}>{formatCurrency(remainingAmount, currency)}</div>
                       <div style={{ fontSize: "11px", color: theme.muted }}>left to save</div>
                     </div>
                   </div>
@@ -913,7 +1062,7 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
                         onClick={() => updateSavings(event, amt)}
                         style={{ flex: 1, padding: "8px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.card, color: theme.text, cursor: "pointer", fontSize: "12px", fontWeight: "600" }}
                       >
-                        +${amt}
+                        +{formatCurrency(Number(amt), currency)}
                       </button>
                     ))}
                   </div>
@@ -943,12 +1092,10 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
           </h3>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))", gap: "16px" }}>
             {recommendations.map((rec) => (
-              <div key={rec.event_id} style={{ padding: "16px", borderRadius: "12px", border: `1px solid ${theme.border}`, background: darkMode ? "#0f172a" : "#f8fafc" }}>
-                <div style={{ fontWeight: "700", fontSize: "14px", marginBottom: "8px", color: theme.text }}>{rec.event_name}</div>
+              <div key={rec.eventId} style={{ padding: "16px", borderRadius: "12px", border: `1px solid ${theme.border}`, background: darkMode ? "#0f172a" : "#f8fafc" }}>
+                <div style={{ fontWeight: "700", fontSize: "14px", marginBottom: "8px", color: theme.text }}>{rec.eventName}</div>
                 <div style={{ fontSize: "13px", color: theme.muted, lineHeight: "1.6" }}>
-                  <div><strong>Daily Target:</strong> ${rec.daily_target.toFixed(2)}</div>
-                  <div><strong>Status:</strong> {rec.on_track ? "✅ On track" : "⚠️ Behind target"}</div>
-                  <div style={{ marginTop: "8px", color: theme.text }}>{rec.suggestion}</div>
+                  <div style={{ marginTop: "4px", color: theme.text }}>{rec.message}</div>
                 </div>
               </div>
             ))}
@@ -975,13 +1122,13 @@ export default function PlannerTab({ theme, darkMode, aiProcessing, setAiProcess
                   <div style={{ padding: "12px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.card }}>
                     <div style={{ fontWeight: "800" }}>Created Event</div>
                     <div style={{ fontSize: "14px", marginTop: "6px" }}>{lastGeneratedPlan.event.name} — {lastGeneratedPlan.event.date || 'TBD'}</div>
-                    <div style={{ fontSize: "13px", color: theme.muted }}>${(lastGeneratedPlan.event.budget_goal || 0).toLocaleString()}</div>
+                    <div style={{ fontSize: "13px", color: theme.muted }}>{formatCurrency(lastGeneratedPlan.event.budget_goal || 0, currency)}</div>
                   </div>
                 )}
                 {lastGeneratedPlan.wallet && (
                   <div style={{ padding: "12px", borderRadius: "8px", border: `1px solid ${theme.border}`, background: theme.card }}>
                     <div style={{ fontWeight: "800" }}>Created Wallet</div>
-                    <div style={{ fontSize: "14px", marginTop: "6px" }}>{lastGeneratedPlan.wallet.name} — ${(lastGeneratedPlan.wallet.target_amount || 0).toLocaleString()}</div>
+                    <div style={{ fontSize: "14px", marginTop: "6px" }}>{lastGeneratedPlan.wallet.name} — {formatCurrency(lastGeneratedPlan.wallet.target_amount || 0, currency)}</div>
                   </div>
                 )}
                 {lastGeneratedPlan.tasks && Array.isArray(lastGeneratedPlan.tasks) && (

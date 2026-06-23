@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from "react";
 import { plannerApi } from "../api";
-import { formatErrorMessage } from "../utils/uiHelpers";
+import { formatErrorMessage, formatCurrency } from "../utils/uiHelpers";
 
-export const EventTemplatesPanel = ({ onEventCreated, darkMode }) => {
+export const EventTemplatesPanel = ({ onEventCreated, darkMode, currency = "USD" }) => {
   const [templates, setTemplates] = useState([]);
   const [selectedTemplate, setSelectedTemplate] = useState(null);
   const [eventName, setEventName] = useState("");
@@ -79,7 +79,7 @@ export const EventTemplatesPanel = ({ onEventCreated, darkMode }) => {
             <div className="text-3xl mb-2">{template.icon}</div>
             <h3 style={{ color: theme.text }} className="font-bold mb-1">{template.name}</h3>
             <p style={{ color: theme.muted }} className="text-sm">
-              Budget: ${template.defaultBudget.toLocaleString()}
+              Budget: {formatCurrency(template.defaultBudget, currency)}
             </p>
             <p style={{ color: theme.muted }} className="text-xs mt-2">
               {template.suggestedWallets.length} wallets included
@@ -119,7 +119,7 @@ export const EventTemplatesPanel = ({ onEventCreated, darkMode }) => {
           {selectedTemplate.suggestedWallets.map((wallet, idx) => (
             <div key={idx} style={{ backgroundColor: theme.bg }} className="p-3 rounded-lg flex justify-between">
               <span style={{ color: theme.text }}>{wallet.name}</span>
-              <span style={{ color: theme.muted }} className="font-semibold">${wallet.targetAmount}</span>
+              <span style={{ color: theme.muted }} className="font-semibold">{formatCurrency(wallet.targetAmount, currency)}</span>
             </div>
           ))}
         </div>

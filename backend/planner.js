@@ -1,68 +1,187 @@
-const express = require("express");
+const express = require('express');
 const router = express.Router();
-const dbAsync = require("./utils/db-async");
-const auth = require("./middleware/auth");
-const llmService = require("./services/llmService");
+const dbAsync = require('./utils/db-async');
+const auth = require('./middleware/auth');
+const axios = require('axios');
+const crypto = require('crypto');
+const twilio = require('twilio');
+const { getEventPlanningAdvice, generateEventPlan } = require('./services/llmService');
+const { sendEventDueAlert } = require('./services/notificationService');
 
-// GET all events
-router.get("/", auth, async (req, res, next) => {
+// Simple in-memory mpesa request store for quick lookup (still persist to DB)
+const mpesaRequests = {};
+
+const MPESA_ENV = process.env.MPESA_ENV || 'sandbox';
+const MPESA_BASE_URL = MPESA_ENV === 'production'
+  ? 'https://api.safaricom.co.ke'
+  : 'https://sandbox.safaricom.co.ke';
+
+const formatMpesaPhone = (phone) => {
+  if (!phone) return '';
+  const normalized = String(phone).trim();
+  if (normalized.startsWith('0')) return `254${normalized.slice(1)}`;
+  if (normalized.startsWith('+')) return normalized.slice(1);
+  if (normalized.startsWith('254')) return normalized;
+  return normalized;
+};
+
+const getMpesaTimestamp = () => {
+  const date = new Date();
+  return `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}${String(date.getHours()).padStart(2, '0')}${String(date.getMinutes()).padStart(2, '0')}${String(date.getSeconds()).padStart(2, '0')}`;
+};
+
+const getMpesaAccessToken = async () => {
+  const key = process.env.MPESA_CONSUMER_KEY;
+  const secret = process.env.MPESA_CONSUMER_SECRET;
+  if (!key || !secret) throw new Error('Missing MPESA_CONSUMER_KEY or MPESA_CONSUMER_SECRET');
+  const token = Buffer.from(`${key}:${secret}`).toString('base64');
+  const response = await axios.get(`${MPESA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials`, {
+    headers: { Authorization: `Basic ${token}` },
+  });
+  return response.data.access_token;
+};
+
+const getStkPassword = (timestamp) => {
+  const shortcode = process.env.MPESA_SHORTCODE;
+  const passkey = process.env.MPESA_PASSKEY;
+  if (!shortcode || !passkey) throw new Error('Missing MPESA_SHORTCODE or MPESA_PASSKEY');
+  return Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
+};
+
+const sendSms = async (to, body) => {
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  const from = process.env.TWILIO_FROM;
+  if (sid && token && from) {
+    const client = twilio(sid, token);
+    return client.messages.create({ to, from, body });
+  }
+  console.log(`SMS to ${to}: ${body}`);
+  return Promise.resolve({ sid: 'dev', body });
+};
+
+// GET events for user
+router.get('/', auth, async (req, res, next) => {
   try {
-    const rows = await dbAsync.all("SELECT * FROM events WHERE user_id = ? ORDER BY date ASC", [req.user.id]);
+    const rows = await dbAsync.all('SELECT * FROM events WHERE user_id = ? ORDER BY date ASC', [req.user.id]);
     res.json(rows);
   } catch (err) {
     next(err);
   }
 });
 
-// CREATE event
-router.post("/", auth, async (req, res, next) => {
-  const { name, date, budget_goal, current_savings, notes, type } = req.body;
-  if (!name) return res.status(400).json({ message: "Event name is required" });
-  
+// POST create a new event
+router.post('/', auth, async (req, res, next) => {
   try {
+    const { name, date, budget_goal, current_savings, notes, type } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: 'Event name is required' });
+    }
+
     const result = await dbAsync.run(
-      "INSERT INTO events (name, date, budget_goal, current_savings, notes, type, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [name, date, budget_goal || 0, current_savings || 0, notes, type || 'General', req.user.id]
+      'INSERT INTO events (user_id, name, date, budget_goal, current_savings, notes, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)',
+      [req.user.id, name.trim(), date || null, parseFloat(budget_goal) || 0, parseFloat(current_savings) || 0, notes || null, type || 'General']
     );
-    res.json({ id: result.id, message: "Event created" });
+
+    const event = await dbAsync.get('SELECT * FROM events WHERE id = ?', [result.id]);
+    res.status(201).json(event);
   } catch (err) {
     next(err);
   }
 });
 
-// UPDATE event
-router.put("/:id", auth, async (req, res, next) => {
-  const { name, date, budget_goal, current_savings, notes, type } = req.body;
+// POST generate a complete event setup using AI
+router.post('/ai-generate-plan', auth, async (req, res, next) => {
   try {
-    await dbAsync.run(
-      "UPDATE events SET name=?, date=?, budget_goal=?, current_savings=?, notes=?, type=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?",
-      [name, date, budget_goal, current_savings, notes, type || 'General', req.params.id, req.user.id]
+    const { prompt } = req.body;
+    if (!prompt || !prompt.trim()) {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    const plan = await generateEventPlan(prompt.trim());
+
+    // 1. Create the event
+    const eventResult = await dbAsync.run(
+      'INSERT INTO events (user_id, name, date, budget_goal, current_savings, notes, type, ai_plan, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)',
+      [
+        req.user.id,
+        plan.event.name,
+        plan.event.date || null,
+        parseFloat(plan.event.budget_goal) || 0,
+        0, // Start with 0 savings for AI-generated event
+        plan.event.notes || null,
+        plan.event.type || 'General',
+        plan.event.notes || null // Save plan summary as ai_plan
+      ]
     );
-    res.json({ message: "Event updated" });
+    const eventId = eventResult.id;
+
+    // 2. Create the linked wallet
+    let walletId = null;
+    if (plan.wallet) {
+      const walletResult = await dbAsync.run(
+        'INSERT INTO wallets (user_id, name, type, balance, target_amount, event_id, notes, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)',
+        [
+          req.user.id,
+          plan.wallet.name,
+          plan.wallet.type || 'Savings',
+          parseFloat(plan.wallet.target_amount) || parseFloat(plan.event.budget_goal) || 0,
+          eventId,
+          plan.wallet.notes || ''
+        ]
+      );
+      walletId = walletResult.id;
+    }
+
+    // 3. Create tasks
+    const createdTasks = [];
+    if (Array.isArray(plan.tasks)) {
+      for (const t of plan.tasks) {
+        const taskResult = await dbAsync.run(
+          `INSERT INTO tasks (title, notes, category, board, priority, completed, due_date, recurrence, reminder_date, reminder_time, reminder_channel, estimated_minutes, user_id, event_id) VALUES (?, ?, ?, ?, ?, 0, ?, null, null, null, 'email', null, ?, ?)`,
+          [
+            t.title?.trim() || "Untitled Task",
+            t.notes || null,
+            t.category || "Personal",
+            t.board || "To Do",
+            t.priority || "Medium",
+            t.due_date || null,
+            req.user.id,
+            eventId
+          ]
+        );
+        createdTasks.push({ id: taskResult.id, title: t.title });
+      }
+    }
+
+    res.json({
+      message: `AI Event plan generated! Created event "${plan.event.name}", linked wallet, and ${createdTasks.length} task(s).`,
+      event: {
+        id: eventId,
+        name: plan.event.name,
+        date: plan.event.date,
+        budget_goal: plan.event.budget_goal
+      },
+      wallet: plan.wallet ? {
+        id: walletId,
+        name: plan.wallet.name,
+        target_amount: plan.wallet.target_amount
+      } : null,
+      tasks: createdTasks
+    });
   } catch (err) {
     next(err);
   }
 });
 
-// DELETE event
-router.delete("/:id", auth, async (req, res, next) => {
-  try {
-    await dbAsync.run("UPDATE wallets SET event_id = NULL WHERE event_id = ? AND user_id = ?", [req.params.id, req.user.id]);
-    await dbAsync.run("DELETE FROM events WHERE id=? AND user_id=?", [req.params.id, req.user.id]);
-    res.json({ message: "Event deleted and linked wallets detached" });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET all wallets with associated event names
-router.get("/wallets", auth, async (req, res, next) => {
+// GET wallets with optional event name
+router.get('/wallets', auth, async (req, res, next) => {
   try {
     const rows = await dbAsync.all(
-      `SELECT wallets.*, events.name AS event_name 
-       FROM wallets 
-       LEFT JOIN events ON wallets.event_id = events.id 
-       WHERE wallets.user_id = ? 
+      `SELECT wallets.*, events.name AS event_name
+       FROM wallets
+       LEFT JOIN events ON wallets.event_id = events.id
+       WHERE wallets.user_id = ?
        ORDER BY wallets.name ASC`,
       [req.user.id]
     );
@@ -72,498 +191,432 @@ router.get("/wallets", auth, async (req, res, next) => {
   }
 });
 
-// CREATE wallet
-router.post("/wallets", auth, async (req, res, next) => {
-  const { name, balance, target_amount, notes, type, event_id } = req.body;
-  if (!name) return res.status(400).json({ message: "Wallet name is required" });
-
+// POST create new wallet
+router.post('/wallets', auth, async (req, res, next) => {
   try {
+    const { name, type, currentBalance, targetAmount, eventId, notes } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: 'Wallet name is required' });
+    }
+
     const result = await dbAsync.run(
-      "INSERT INTO wallets (name, balance, target_amount, notes, type, user_id, event_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [name, balance || 0, target_amount || 0, notes, type || "Savings", req.user.id, event_id || null]
+      'INSERT INTO wallets (user_id, name, type, balance, target_amount, event_id, notes, created_at, updated_at) VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
+      [req.user.id, name.trim(), type || 'Savings', parseFloat(currentBalance) || 0, parseFloat(targetAmount) || 0, eventId || null, notes || '']
     );
-    
-    // Sync to event if linked
-    if (event_id && balance > 0) {
+
+    const wallet = await dbAsync.get('SELECT * FROM wallets WHERE id=?', [result.id]);
+    res.status(201).json(wallet);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST generic manual deposit (non-M-Pesa payment methods)
+router.post('/wallets/:id/deposit', auth, async (req, res, next) => {
+  try {
+    const wallet = await dbAsync.get('SELECT * FROM wallets WHERE id=? AND user_id=?', [req.params.id, req.user.id]);
+    if (!wallet) return res.status(404).json({ message: 'Wallet not found' });
+
+    const { amount, method, reference } = req.body;
+    const numericAmount = parseFloat(amount) || 0;
+    if (numericAmount <= 0) return res.status(400).json({ message: 'Invalid amount' });
+
+    const newBalance = (parseFloat(wallet.balance) || 0) + numericAmount;
+    const note = `\nDeposit via ${method || 'Manual'}${reference ? ` (ref: ${reference})` : ''}: ${numericAmount}`;
+    await dbAsync.run(
+      'UPDATE wallets SET balance=?, notes=COALESCE(notes,"")||?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?',
+      [newBalance, note, wallet.id, req.user.id]
+    );
+    if (wallet.event_id) {
+      await dbAsync.run('UPDATE events SET current_savings=current_savings+?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?', [numericAmount, wallet.event_id, req.user.id]);
+    }
+    const updated = await dbAsync.get('SELECT * FROM wallets WHERE id=?', [wallet.id]);
+    res.json({ message: 'Deposit successful', wallet: updated });
+  } catch (err) { next(err); }
+});
+
+// POST withdrawal from wallet (only allowed when linked event is due/overdue or no event)
+router.post('/wallets/:id/withdraw', auth, async (req, res, next) => {
+  try {
+    const wallet = await dbAsync.get(
+      `SELECT wallets.*, events.date AS event_date FROM wallets
+       LEFT JOIN events ON wallets.event_id = events.id
+       WHERE wallets.id=? AND wallets.user_id=?`,
+      [req.params.id, req.user.id]
+    );
+    if (!wallet) return res.status(404).json({ message: 'Wallet not found' });
+
+    // If linked to an event, event must be due or overdue
+    if (wallet.event_id && wallet.event_date) {
+      const eventDate = new Date(wallet.event_date);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      if (eventDate > today) {
+        return res.status(403).json({ message: 'Withdrawal not allowed yet. Event is not due until ' + wallet.event_date });
+      }
+    }
+
+    const { amount, method, reference } = req.body;
+    const numericAmount = parseFloat(amount) || 0;
+    const currentBalance = parseFloat(wallet.balance) || 0;
+
+    if (numericAmount <= 0) return res.status(400).json({ message: 'Invalid amount' });
+    if (numericAmount > currentBalance) return res.status(400).json({ message: 'Insufficient balance' });
+
+    const newBalance = currentBalance - numericAmount;
+    const note = `\nWithdrawal via ${method || 'Manual'}${reference ? ` (ref: ${reference})` : ''}: -${numericAmount}`;
+    await dbAsync.run(
+      'UPDATE wallets SET balance=?, notes=COALESCE(notes,"")||?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?',
+      [newBalance, note, wallet.id, req.user.id]
+    );
+    if (wallet.event_id) {
+      await dbAsync.run('UPDATE events SET current_savings=MAX(0,current_savings-?), updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?', [numericAmount, wallet.event_id, req.user.id]);
+    }
+    const updated = await dbAsync.get('SELECT * FROM wallets WHERE id=?', [wallet.id]);
+    res.json({ message: 'Withdrawal successful', wallet: updated });
+  } catch (err) { next(err); }
+});
+
+// Minimal STK push route with dev mock when credentials are missing
+router.post('/wallets/:id/stk-push', auth, async (req, res, next) => {
+
+  try {
+    const wallet = await dbAsync.get('SELECT * FROM wallets WHERE id=? AND user_id=?', [req.params.id, req.user.id]);
+    if (!wallet) return res.status(404).json({ message: 'Wallet not found' });
+
+    const { amount, phone } = req.body;
+    const numericAmount = parseFloat(amount) || 0;
+    if (!numericAmount || numericAmount <= 0) return res.status(400).json({ message: 'Invalid amount' });
+    if (!phone || typeof phone !== 'string') return res.status(400).json({ message: 'Phone number is required' });
+
+    const msisdn = formatMpesaPhone(phone);
+
+    const missingCreds = !process.env.MPESA_CONSUMER_KEY || !process.env.MPESA_CONSUMER_SECRET || !process.env.MPESA_SHORTCODE || !process.env.MPESA_PASSKEY;
+    if (missingCreds) {
+      // Dev mock: persist a dev request record and immediately apply deposit so frontend can continue development without Daraja
+      const fakeId = `DEV_${Date.now()}`;
+      const receipt = `DEVRECEIPT_${Date.now()}`;
+      mpesaRequests[fakeId] = {
+        userId: req.user.id,
+        walletId: wallet.id,
+        amount: numericAmount,
+        phone: msisdn,
+        status: 'completed',
+        createdAt: Date.now(),
+        receipt,
+      };
+
+      // Persist to DB
       await dbAsync.run(
-        "UPDATE events SET current_savings = current_savings + ?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?",
-        [balance, event_id, req.user.id]
+        'INSERT INTO mpesa_requests (merchant_request_id, user_id, wallet_id, amount, phone, status, receipt, daraja_response) VALUES (?,?,?,?,?,?,?,?)',
+        [fakeId, req.user.id, wallet.id, numericAmount, msisdn, 'completed', receipt, JSON.stringify({ dev: true })]
       );
-    }
-    
-    res.json({ id: result.id, message: "Wallet created" });
-  } catch (err) {
-    next(err);
-  }
-});
 
-// UPDATE wallet with synchronization logic
-router.put("/wallets/:id", auth, async (req, res, next) => {
-  const { name, balance, target_amount, notes, type, event_id } = req.body;
-  try {
-    const oldWallet = await dbAsync.get("SELECT * FROM wallets WHERE id=? AND user_id=?", [req.params.id, req.user.id]);
-    if (!oldWallet) return res.status(404).json({ message: "Wallet not found" });
-
-    const newBalance = parseFloat(balance) || 0;
-    const oldBalance = parseFloat(oldWallet.balance) || 0;
-    const balanceDiff = newBalance - oldBalance;
-
-    const newEventId = event_id ? parseInt(event_id) : null;
-    const oldEventId = oldWallet.event_id ? parseInt(oldWallet.event_id) : null;
-
-    await dbAsync.run(
-      "UPDATE wallets SET name=?, balance=?, target_amount=?, notes=?, type=?, event_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?",
-      [name, newBalance, target_amount || 0, notes, type || "Savings", newEventId, req.params.id, req.user.id]
-    );
-
-    // Sync Event savings
-    if (newEventId === oldEventId) {
-      if (newEventId && balanceDiff !== 0) {
-        await dbAsync.run(
-          "UPDATE events SET current_savings = current_savings + ?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?",
-          [balanceDiff, newEventId, req.user.id]
-        );
+      const newBalance = (parseFloat(wallet.balance) || 0) + numericAmount;
+      await dbAsync.run(
+        'UPDATE wallets SET balance=?, notes = COALESCE(notes, "") || ? , updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?',
+        [newBalance, `\nDEV M-Pesa STK Push deposit: ${numericAmount} (dev)`, wallet.id, req.user.id]
+      );
+      if (wallet.event_id) {
+        await dbAsync.run('UPDATE events SET current_savings = current_savings + ?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?', [numericAmount, wallet.event_id, req.user.id]);
       }
-    } else {
-      // Event changed
-      if (oldEventId) {
-        await dbAsync.run(
-          "UPDATE events SET current_savings = MAX(0, current_savings - ?), updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?",
-          [oldBalance, oldEventId, req.user.id]
-        );
-      }
-      if (newEventId) {
-        await dbAsync.run(
-          "UPDATE events SET current_savings = current_savings + ?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?",
-          [newBalance, newEventId, req.user.id]
-        );
-      }
+
+      return res.json({ message: 'M-Pesa mock push completed (dev)', merchantRequestID: fakeId, receipt });
     }
 
-    res.json({ message: "Wallet updated and event savings synchronized" });
-  } catch (err) {
-    next(err);
-  }
-});
+    // Real Daraja flow
+    const accessToken = await getMpesaAccessToken();
+    const timestamp = getMpesaTimestamp();
+    const password = getStkPassword(timestamp);
+    const shortcode = process.env.MPESA_SHORTCODE;
+    const callbackUrl = process.env.CALLBACK_URL || `http://localhost:${process.env.PORT || 5000}/api/planner/mpesa-callback`;
 
-// DELETE wallet and sync associated event savings
-router.delete("/wallets/:id", auth, async (req, res, next) => {
-  try {
-    const oldWallet = await dbAsync.get("SELECT * FROM wallets WHERE id=? AND user_id=?", [req.params.id, req.user.id]);
-    if (oldWallet) {
-      if (oldWallet.event_id && oldWallet.balance > 0) {
-        await dbAsync.run(
-          "UPDATE events SET current_savings = MAX(0, current_savings - ?), updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?",
-          [oldWallet.balance, oldWallet.event_id, req.user.id]
-        );
-      }
-      await dbAsync.run("DELETE FROM wallets WHERE id=? AND user_id=?", [req.params.id, req.user.id]);
-    }
-    res.json({ message: "Wallet deleted and synchronized" });
-  } catch (err) {
-    next(err);
-  }
-});
+    const payload = {
+      BusinessShortCode: shortcode,
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: 'CustomerPayBillOnline',
+      Amount: numericAmount,
+      PartyA: msisdn,
+      PartyB: shortcode,
+      PhoneNumber: msisdn,
+      CallBackURL: callbackUrl,
+      AccountReference: `Wallet-${wallet.id}`,
+      TransactionDesc: `Deposit to ${wallet.name}`,
+    };
 
-// AI ASSIST FOR AN EVENT
-router.post("/:id/ai-assist", auth, async (req, res, next) => {
-  try {
-    const event = await dbAsync.get("SELECT * FROM events WHERE id=? AND user_id=?", [req.params.id, req.user.id]);
-    if (!event) return res.status(404).json({ message: "Event not found" });
-
-    const advice = await llmService.getEventPlanningAdvice(event);
-    await dbAsync.run(
-      "UPDATE events SET ai_plan=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", 
-      [advice, req.params.id, req.user.id]
-    );
-    res.json({ ai_plan: advice });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// AI EVENT PLAN GENERATOR (inserts event, linked wallet, and helper tasks)
-router.post("/ai-generate-plan", auth, async (req, res, next) => {
-  const { prompt } = req.body;
-  if (!prompt || !prompt.trim()) {
-    return res.status(400).json({ message: "Prompt is required" });
-  }
-
-  try {
-    const plan = await llmService.generateEventPlan(prompt);
-    
-    // Create the event
-    const eventRes = await dbAsync.run(
-      "INSERT INTO events (name, date, budget_goal, current_savings, notes, type, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [
-        plan.event.name,
-        plan.event.date,
-        plan.event.budget_goal || 0,
-        0, // Start with 0 savings, wallet balance will update it
-        plan.event.notes,
-        plan.event.type || 'General',
-        req.user.id
-      ]
-    );
-    const eventId = eventRes.id;
-
-    // Create the linked wallet
-    const walletRes = await dbAsync.run(
-      "INSERT INTO wallets (name, balance, target_amount, notes, type, user_id, event_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [
-        plan.wallet.name,
-        0, // Start with 0 balance
-        plan.wallet.target_amount || plan.event.budget_goal || 0,
-        plan.wallet.notes,
-        plan.wallet.type || 'Savings',
-        req.user.id,
-        eventId
-      ]
-    );
-
-    // Create the tasks
-    const createdTasks = [];
-    if (plan.tasks && Array.isArray(plan.tasks)) {
-      for (const t of plan.tasks) {
-        const taskRes = await dbAsync.run(
-          `INSERT INTO tasks (title, notes, category, board, priority, completed, due_date, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            t.title,
-            t.notes || null,
-            t.category || "Personal",
-            t.board || "To Do",
-            t.priority || "Medium",
-            0,
-            t.due_date || null,
-            req.user.id
-          ]
-        );
-        createdTasks.push({ id: taskRes.id, title: t.title });
-      }
-    }
-
-    res.json({
-      message: "AI Plan successfully generated and imported",
-      event: { id: eventId, ...plan.event },
-      wallet: { id: walletRes.id, ...plan.wallet },
-      tasksCount: createdTasks.length
+    const response = await axios.post(`${MPESA_BASE_URL}/mpesa/stkpush/v1/processrequest`, payload, {
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
+
+    if (response.data.ResponseCode !== '0') {
+      return res.status(400).json({ message: 'M-Pesa push failed', details: response.data });
+    }
+
+    const merchantId = response.data.MerchantRequestID || response.data.CheckoutRequestID || null;
+
+    // Persist pending request
+    await dbAsync.run(
+      'INSERT INTO mpesa_requests (merchant_request_id, checkout_request_id, user_id, wallet_id, amount, phone, status, daraja_response) VALUES (?,?,?,?,?,?,?,?)',
+      [response.data.MerchantRequestID || null, response.data.CheckoutRequestID || null, req.user.id, wallet.id, numericAmount, msisdn, 'pending', JSON.stringify(response.data)]
+    );
+
+    mpesaRequests[merchantId || `RID_${Date.now()}`] = {
+      userId: req.user.id,
+      walletId: wallet.id,
+      amount: numericAmount,
+      phone: msisdn,
+      status: 'pending',
+      createdAt: Date.now(),
+    };
+
+    res.json({ message: 'M-Pesa push initiated', data: response.data });
+  } catch (err) {
+    console.error('M-Pesa STK push error:', err?.response?.data || err.message || err);
+    const errorInfo = err.response?.data || err.message || 'Unknown error';
+    return res.status(err.response?.status || 500).json({ message: 'M-Pesa push failed', details: errorInfo });
+  }
+});
+
+// Daraja/STK push callback endpoint
+router.post('/mpesa-callback', async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const stk = body.Body && body.Body.stkCallback ? body.Body.stkCallback : body.stkCallback || null;
+    if (!stk) return res.status(400).json({ message: 'Invalid callback payload' });
+
+    const resultCode = stk.ResultCode;
+    const merchantRequestID = stk.MerchantRequestID || null;
+    const checkoutRequestID = stk.CheckoutRequestID || null;
+
+    // Find the persisted request
+    let row = null;
+    if (merchantRequestID) row = await dbAsync.get('SELECT * FROM mpesa_requests WHERE merchant_request_id = ?', [merchantRequestID]);
+    if (!row && checkoutRequestID) row = await dbAsync.get('SELECT * FROM mpesa_requests WHERE checkout_request_id = ?', [checkoutRequestID]);
+
+    const darajaJson = JSON.stringify(stk);
+
+    if (resultCode === 0) {
+      // Extract amount and receipt from CallbackMetadata
+      let amount = null;
+      let receipt = null;
+      const items = (stk.CallbackMetadata && stk.CallbackMetadata.Item) || (stk.CallbackMetadata && stk.CallbackMetadata.items) || (stk.CallbackMetadata && stk.CallbackMetadata.Items) || [];
+      items.forEach((it) => {
+        const name = it.Name || it.name || it.key || '';
+        if (name.toLowerCase().includes('amount')) amount = it.Value || it.value;
+        if (name.toLowerCase().includes('mpesareceiptnumber') || name.toLowerCase().includes('receipt')) receipt = it.Value || it.value;
+      });
+
+      // Update mpesa_requests row
+      if (row) {
+        await dbAsync.run('UPDATE mpesa_requests SET status=?, receipt=?, daraja_response=?, updated_at=CURRENT_TIMESTAMP WHERE id=?', ['completed', receipt || null, darajaJson, row.id]);
+
+        // Apply to wallet
+        const wallet = await dbAsync.get('SELECT * FROM wallets WHERE id=?', [row.wallet_id]);
+        if (wallet) {
+          const newBalance = (parseFloat(wallet.balance) || 0) + (amount || row.amount || 0);
+          await dbAsync.run('UPDATE wallets SET balance=?, notes = COALESCE(notes, "") || ? , updated_at=CURRENT_TIMESTAMP WHERE id=?', [newBalance, `\nM-Pesa STK deposit: ${amount || row.amount} receipt:${receipt || ''}`, wallet.id]);
+          if (wallet.event_id) {
+            await dbAsync.run('UPDATE events SET current_savings = current_savings + ?, updated_at=CURRENT_TIMESTAMP WHERE id=?', [amount || row.amount || 0, wallet.event_id]);
+          }
+        }
+      }
+
+      // keep in-memory quick lookup
+      if (merchantRequestID) mpesaRequests[merchantRequestID] = { status: 'completed' };
+      if (checkoutRequestID) mpesaRequests[checkoutRequestID] = { status: 'completed' };
+
+      // Respond quickly to Daraja
+      return res.json({ ResultCode: 0, ResultDesc: 'Success' });
+    }
+
+    // Non-zero result -> failed or canceled
+    if (row) {
+      await dbAsync.run('UPDATE mpesa_requests SET status=?, daraja_response=?, updated_at=CURRENT_TIMESTAMP WHERE id=?', ['failed', darajaJson, row.id]);
+    }
+
+    if (merchantRequestID) mpesaRequests[merchantRequestID] = { status: 'failed' };
+    if (checkoutRequestID) mpesaRequests[checkoutRequestID] = { status: 'failed' };
+
+    return res.json({ ResultCode: 0, ResultDesc: 'Received' });
+  } catch (err) {
+    console.error('MPesa callback processing error:', err);
+    return res.status(500).json({ message: 'Callback processing error' });
+  }
+});
+
+// GET mpesa-requests for user
+router.get('/mpesa-requests', auth, async (req, res, next) => {
+  try {
+    const rows = await dbAsync.all(
+      `SELECT mpesa_requests.*, wallets.name AS wallet_name
+       FROM mpesa_requests
+       LEFT JOIN wallets ON mpesa_requests.wallet_id = wallets.id
+       WHERE mpesa_requests.user_id = ?
+       ORDER BY mpesa_requests.created_at DESC`,
+      [req.user.id]
+    );
+    res.json(rows);
   } catch (err) {
     next(err);
   }
 });
 
-// EVENT TEMPLATES
-router.get("/templates", auth, async (req, res, next) => {
+// GET planner event templates (static curated list)
+router.get('/templates', auth, (req, res) => {
   const templates = [
-    {
-      id: "travel",
-      name: "Travel Trip",
-      type: "Travel",
-      icon: "✈️",
-      defaultBudget: 2000,
-      suggestedWallets: [
-        { name: "Flight", type: "Travel", targetAmount: 800 },
-        { name: "Accommodation", type: "Travel", targetAmount: 1000 },
-        { name: "Meals & Activities", type: "Travel", targetAmount: 400 }
-      ]
-    },
-    {
-      id: "wedding",
-      name: "Wedding",
-      type: "Wedding",
-      icon: "💍",
-      defaultBudget: 10000,
-      suggestedWallets: [
-        { name: "Venue", type: "Wedding", targetAmount: 3000 },
-        { name: "Catering", type: "Wedding", targetAmount: 3500 },
-        { name: "Photography", type: "Wedding", targetAmount: 1500 },
-        { name: "Decorations", type: "Wedding", targetAmount: 1500 },
-        { name: "Miscellaneous", type: "Wedding", targetAmount: 500 }
-      ]
-    },
-    {
-      id: "birthday",
-      name: "Birthday Party",
-      type: "Birthday",
-      icon: "🎂",
-      defaultBudget: 500,
-      suggestedWallets: [
-        { name: "Venue", type: "General", targetAmount: 150 },
-        { name: "Cake & Catering", type: "General", targetAmount: 200 },
-        { name: "Decorations & Supplies", type: "General", targetAmount: 150 }
-      ]
-    },
-    {
-      id: "house",
-      name: "Home Renovation",
-      type: "Project",
-      icon: "🏠",
-      defaultBudget: 5000,
-      suggestedWallets: [
-        { name: "Materials", type: "General", targetAmount: 2500 },
-        { name: "Labor", type: "General", targetAmount: 2000 },
-        { name: "Contingency", type: "Emergency", targetAmount: 500 }
-      ]
-    },
-    {
-      id: "education",
-      name: "Education Course",
-      type: "General",
-      icon: "📚",
-      defaultBudget: 1500,
-      suggestedWallets: [
-        { name: "Course Fee", type: "General", targetAmount: 1000 },
-        { name: "Materials", type: "General", targetAmount: 300 },
-        { name: "Certification", type: "General", targetAmount: 200 }
-      ]
-    }
+    { id: 1, name: 'Wedding',     icon: '💍', type: 'Wedding',  defaultBudget: 500000 },
+    { id: 2, name: 'Travel',      icon: '✈️', type: 'Travel',   defaultBudget: 150000 },
+    { id: 3, name: 'Birthday',    icon: '🎂', type: 'Birthday', defaultBudget: 20000  },
+    { id: 4, name: 'Education',   icon: '🎓', type: 'General',  defaultBudget: 100000 },
+    { id: 5, name: 'Emergency Fund', icon: '🛡️', type: 'General', defaultBudget: 50000 },
+    { id: 6, name: 'Home Project',icon: '🏠', type: 'Project',  defaultBudget: 200000 },
   ];
   res.json(templates);
 });
 
-// DUPLICATE EVENT (with all wallets)
-router.post("/:id/duplicate", auth, async (req, res, next) => {
+// POST AI assist for a specific event
+router.post('/:id/ai-assist', auth, async (req, res, next) => {
   try {
-    const event = await dbAsync.get("SELECT * FROM events WHERE id=? AND user_id=?", [req.params.id, req.user.id]);
-    if (!event) return res.status(404).json({ message: "Event not found" });
-
-    // Create new event with "Copy of" prefix and no date
-    const newEventRes = await dbAsync.run(
-      "INSERT INTO events (name, date, budget_goal, current_savings, notes, type, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [`Copy of ${event.name}`, null, event.budget_goal, 0, event.notes, event.type, req.user.id]
+    const event = await dbAsync.get(
+      'SELECT * FROM events WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
     );
-    const newEventId = newEventRes.id;
+    if (!event) return res.status(404).json({ message: 'Event not found' });
 
-    // Duplicate all linked wallets
-    const wallets = await dbAsync.all("SELECT * FROM wallets WHERE event_id=? AND user_id=?", [event.id, req.user.id]);
-    const newWalletIds = [];
-    for (const wallet of wallets) {
-      const newWalletRes = await dbAsync.run(
-        "INSERT INTO wallets (name, balance, target_amount, notes, type, user_id, event_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [`${wallet.name} (copy)`, 0, wallet.target_amount, wallet.notes, wallet.type, req.user.id, newEventId]
+    const ai_plan = await getEventPlanningAdvice(event);
+
+    // Persist the generated plan to the event record
+    await dbAsync.run(
+      'UPDATE events SET ai_plan = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?',
+      [ai_plan, event.id, req.user.id]
+    );
+
+    res.json({ ai_plan });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST duplicate an event and its linked wallets
+router.post('/:id/duplicate', auth, async (req, res, next) => {
+  try {
+    const event = await dbAsync.get(
+      'SELECT * FROM events WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
+    );
+    if (!event) return res.status(404).json({ message: 'Event not found' });
+
+    const result = await dbAsync.run(
+      'INSERT INTO events (user_id, name, date, budget_goal, current_savings, notes, type, ai_plan, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
+      [req.user.id, `${event.name} (Copy)`, event.date, event.budget_goal, 0, event.notes, event.type, null]
+    );
+    const newEventId = result.id;
+
+    // Duplicate linked wallets (reset balance to 0)
+    const wallets = await dbAsync.all('SELECT * FROM wallets WHERE event_id = ? AND user_id = ?', [event.id, req.user.id]);
+    for (const w of wallets) {
+      await dbAsync.run(
+        'INSERT INTO wallets (user_id, name, type, balance, target_amount, event_id, notes, created_at, updated_at) VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
+        [req.user.id, w.name, w.type, 0, w.target_amount, newEventId, w.notes]
       );
-      newWalletIds.push(newWalletRes.id);
     }
 
-    res.json({
-      message: "Event duplicated successfully",
-      event_id: newEventId,
-      wallet_count: newWalletIds.length
-    });
+    res.json({ message: 'Event duplicated', id: newEventId, wallet_count: wallets.length });
   } catch (err) {
     next(err);
   }
 });
 
-// DUPLICATE WALLET
-router.post("/wallets/:id/duplicate", auth, async (req, res, next) => {
+// POST /notify-due-events — called by the scheduler or manually
+// Checks all events due today / within 3 days / overdue and sends alerts
+router.post('/notify-due-events', async (req, res, next) => {
+  // Allow internal calls (with server secret) or skip auth for scheduler
+  const secret = req.headers['x-internal-secret'];
+  if (secret !== (process.env.INTERNAL_SECRET || 'cluster-internal')) {
+    return res.status(403).json({ message: 'Forbidden' });
+  }
+
   try {
-    const wallet = await dbAsync.get("SELECT * FROM wallets WHERE id=? AND user_id=?", [req.params.id, req.user.id]);
-    if (!wallet) return res.status(404).json({ message: "Wallet not found" });
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const in3Days = new Date(today);
+    in3Days.setDate(today.getDate() + 3);
 
-    const newWalletRes = await dbAsync.run(
-      "INSERT INTO wallets (name, balance, target_amount, notes, type, user_id, event_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [`${wallet.name} (copy)`, 0, wallet.target_amount, wallet.notes, wallet.type, req.user.id, wallet.event_id]
-    );
+    // Fetch events with a date, joining user contact info
+    const events = await dbAsync.all(`
+      SELECT events.*, users.username, users.email, users.phone
+      FROM events
+      JOIN users ON events.user_id = users.id
+      WHERE events.date IS NOT NULL AND events.date != ''
+    `);
 
-    res.json({
-      message: "Wallet duplicated successfully",
-      wallet_id: newWalletRes.id
-    });
+    const alerts = [];
+
+    for (const ev of events) {
+      const evDate = new Date(ev.date);
+      evDate.setHours(0, 0, 0, 0);
+      const daysLeft = Math.round((evDate - today) / (1000 * 60 * 60 * 24));
+
+      // Alert for: today (0), 1 day, 3 days, or overdue (negative)
+      const shouldAlert = daysLeft === 0 || daysLeft === 1 || daysLeft === 3 || (daysLeft < 0 && daysLeft >= -7);
+      if (!shouldAlert) continue;
+
+      const user = { id: ev.user_id, username: ev.username, email: ev.email, phone: ev.phone };
+      const event = { id: ev.id, name: ev.name, date: ev.date, budget_goal: ev.budget_goal, current_savings: ev.current_savings, notes: ev.notes };
+
+      const result = await sendEventDueAlert({ user, event, daysLeft });
+      alerts.push({ eventId: ev.id, eventName: ev.name, daysLeft, result });
+    }
+
+    console.log(`[Scheduler] Processed ${alerts.length} event alert(s).`);
+    res.json({ processed: alerts.length, alerts });
   } catch (err) {
     next(err);
   }
 });
 
-// SMART BUDGET RECOMMENDATIONS
-router.post("/recommendations", auth, async (req, res, next) => {
+// POST planner recommendations (derived from user events)
+router.post('/recommendations', auth, async (req, res, next) => {
   try {
     const events = await dbAsync.all(
-      "SELECT * FROM events WHERE user_id=? AND budget_goal > 0 AND date IS NOT NULL ORDER BY date DESC LIMIT 10",
+      'SELECT * FROM events WHERE user_id = ? ORDER BY date ASC',
       [req.user.id]
     );
 
-    if (events.length === 0) {
-      return res.json({ message: "No events with budgets found", recommendations: [] });
-    }
-
-    // Calculate savings velocity and recommendations
     const recommendations = [];
-    for (const event of events) {
-      const eventDate = new Date(event.date);
-      const today = new Date();
-      const daysRemaining = Math.ceil((eventDate - today) / (1000 * 60 * 60 * 24));
-      const remaining = Math.max(0, (event.budget_goal || 0) - (event.current_savings || 0));
-      
-      if (daysRemaining > 0 && remaining > 0) {
-        const dailyTarget = (remaining / daysRemaining).toFixed(2);
-        const isOnTrack = event.current_savings >= (event.budget_goal * (1 - daysRemaining / 365));
-        
+
+    for (const ev of events) {
+      const goal = parseFloat(ev.budget_goal) || 0;
+      const saved = parseFloat(ev.current_savings) || 0;
+      const progress = goal > 0 ? (saved / goal) * 100 : 0;
+
+      // Upcoming event with low savings
+      if (ev.date) {
+        const daysLeft = Math.ceil((new Date(ev.date) - new Date()) / (1000 * 60 * 60 * 24));
+        if (daysLeft > 0 && daysLeft <= 30 && progress < 80) {
+          recommendations.push({
+            eventId: ev.id,
+            eventName: ev.name,
+            type: 'urgent',
+            message: `"${ev.name}" is in ${daysLeft} day${daysLeft === 1 ? '' : 's'} and only ${progress.toFixed(0)}% funded. Consider boosting your savings now.`,
+          });
+        }
+      }
+
+      // Significantly underfunded events
+      if (goal > 0 && progress < 30 && !recommendations.find(r => r.eventId === ev.id)) {
         recommendations.push({
-          event_id: event.id,
-          event_name: event.name,
-          budget_goal: event.budget_goal,
-          current_savings: event.current_savings,
-          remaining,
-          days_remaining: daysRemaining,
-          daily_target: parseFloat(dailyTarget),
-          on_track: isOnTrack,
-          suggestion: isOnTrack 
-            ? `✅ On track! Continue saving $${dailyTarget} daily.`
-            : `⚠️ Behind schedule. Increase daily savings to $${dailyTarget} to meet goal.`
+          eventId: ev.id,
+          eventName: ev.name,
+          type: 'underfunded',
+          message: `"${ev.name}" is only ${progress.toFixed(0)}% funded. Set up a regular savings plan to reach your goal.`,
         });
       }
     }
 
-    res.json({ recommendations });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ========================
-// PLANNER ANALYTICS ENDPOINTS
-// ========================
-
-// GET SAVINGS VELOCITY (savings per week)
-router.get("/analytics/savings-velocity", auth, async (req, res, next) => {
-  try {
-    const events = await dbAsync.all(
-      "SELECT id, name, created_at, current_savings FROM events WHERE user_id=? ORDER BY created_at ASC",
-      [req.user.id]
-    );
-
-    // Group by week and calculate cumulative savings
-    const weeklyData = {};
-    for (const event of events) {
-      const date = new Date(event.created_at);
-      const weekKey = date.toISOString().split('T')[0]; // YYYY-MM-DD
-      if (!weeklyData[weekKey]) {
-        weeklyData[weekKey] = 0;
-      }
-      weeklyData[weekKey] += parseFloat(event.current_savings) || 0;
-    }
-
-    const result = Object.keys(weeklyData)
-      .sort()
-      .map(week => ({
-        week,
-        total_savings: weeklyData[week]
-      }));
-
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET EVENT COMPLETION FORECAST
-router.get("/analytics/event-forecast", auth, async (req, res, next) => {
-  try {
-    const events = await dbAsync.all(
-      "SELECT id, name, date, budget_goal, current_savings FROM events WHERE user_id=? AND date IS NOT NULL ORDER BY date ASC",
-      [req.user.id]
-    );
-
-    const forecasts = events.map(event => {
-      const eventDate = new Date(event.date);
-      const today = new Date();
-      const daysRemaining = Math.ceil((eventDate - today) / (1000 * 60 * 60 * 24));
-      const remaining = Math.max(0, (event.budget_goal || 0) - (event.current_savings || 0));
-      
-      // Simple linear projection
-      let projectedDate = null;
-      if (event.current_savings > 0 && daysRemaining > 0) {
-        const savingsRate = event.current_savings / ((new Date() - new Date(event.date)) / (1000 * 60 * 60 * 24));
-        if (savingsRate > 0) {
-          const daysToComplete = remaining / savingsRate;
-          projectedDate = new Date(today.getTime() + daysToComplete * 24 * 60 * 60 * 1000);
-        }
-      }
-
-      return {
-        event_id: event.id,
-        event_name: event.name,
-        budget_goal: event.budget_goal,
-        current_savings: event.current_savings,
-        remaining,
-        target_date: event.date,
-        projected_completion: projectedDate ? projectedDate.toISOString().split('T')[0] : null,
-        on_track: projectedDate && projectedDate <= eventDate,
-        progress_percent: Math.round((event.current_savings / (event.budget_goal || 1)) * 100)
-      };
-    });
-
-    res.json(forecasts);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET GANTT CHART DATA FOR EVENTS
-router.get("/analytics/gantt-chart", auth, async (req, res, next) => {
-  try {
-    const events = await dbAsync.all(
-      `SELECT e.*, COUNT(DISTINCT w.id) as wallet_count, SUM(w.balance) as total_balance
-       FROM events e
-       LEFT JOIN wallets w ON e.id = w.event_id
-       WHERE e.user_id=? AND e.date IS NOT NULL
-       GROUP BY e.id
-       ORDER BY e.date ASC`,
-      [req.user.id]
-    );
-
-    const ganttData = events.map(event => {
-      const eventDate = new Date(event.date);
-      const createdDate = new Date(event.created_at);
-      
-      return {
-        id: event.id,
-        name: event.name,
-        type: event.type,
-        start_date: event.created_at ? event.created_at.split('T')[0] : null,
-        end_date: event.date,
-        budget_goal: event.budget_goal,
-        current_savings: event.current_savings,
-        wallet_count: event.wallet_count,
-        total_balance: event.total_balance,
-        progress_percent: Math.round((event.current_savings / (event.budget_goal || 1)) * 100),
-        status: event.current_savings >= event.budget_goal ? 'completed' : 'in-progress'
-      };
-    });
-
-    res.json(ganttData);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET WALLET BREAKDOWN FOR AN EVENT
-router.get("/:eventId/wallet-breakdown", auth, async (req, res, next) => {
-  try {
-    const event = await dbAsync.get("SELECT * FROM events WHERE id=? AND user_id=?", [req.params.eventId, req.user.id]);
-    if (!event) return res.status(404).json({ message: "Event not found" });
-
-    const wallets = await dbAsync.all(
-      "SELECT * FROM wallets WHERE event_id=? AND user_id=? ORDER BY name ASC",
-      [req.params.eventId, req.user.id]
-    );
-
-    const breakdown = wallets.map(wallet => ({
-      ...wallet,
-      percent_of_budget: ((wallet.balance / (event.budget_goal || 1)) * 100).toFixed(2),
-      percent_of_target: ((wallet.balance / (wallet.target_amount || 1)) * 100).toFixed(2)
-    }));
-
-    res.json({
-      event_id: req.params.eventId,
-      event_name: event.name,
-      total_budget: event.budget_goal,
-      total_allocated: wallets.reduce((sum, w) => sum + (w.target_amount || 0), 0),
-      total_saved: wallets.reduce((sum, w) => sum + (w.balance || 0), 0),
-      wallets: breakdown
-    });
+    res.json({ recommendations: recommendations.slice(0, 5) });
   } catch (err) {
     next(err);
   }

@@ -16,7 +16,9 @@ db.run(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE,
-    password TEXT
+    password TEXT,
+    email TEXT,
+    phone TEXT
   )
 `);
 
@@ -131,6 +133,29 @@ db.run(`
 `);
 
 // =======================
+// MPESA REQUESTS TABLE
+// Tracks Daraja STK push requests and their completion state
+// =======================
+db.run(`
+  CREATE TABLE IF NOT EXISTS mpesa_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    merchant_request_id TEXT,
+    checkout_request_id TEXT,
+    user_id INTEGER,
+    wallet_id INTEGER,
+    amount REAL,
+    phone TEXT,
+    status TEXT,
+    receipt TEXT,
+    daraja_response TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (wallet_id) REFERENCES wallets(id)
+  )
+`);
+
+// =======================
 // EVENT TEMPLATES TABLE (NEW)
 // =======================
 db.run(`
@@ -223,6 +248,8 @@ const migrations = [
   "ALTER TABLE wallets ADD COLUMN event_id INTEGER",
   "ALTER TABLE users ADD COLUMN country TEXT",
   "ALTER TABLE users ADD COLUMN currency TEXT",
+  "ALTER TABLE users ADD COLUMN email TEXT",
+  "ALTER TABLE users ADD COLUMN phone TEXT",
   // Backfill defaults
   "UPDATE users SET country = 'Kenya' WHERE country IS NULL",
   "UPDATE users SET currency = 'KES' WHERE currency IS NULL",

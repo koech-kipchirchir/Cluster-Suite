@@ -7,6 +7,7 @@ import KanbanTab from "../components/KanbanTab";
 import TaskItem from "../components/TaskItem";
 import PlannerTab from "../components/PlannerTab";
 import WalletTab from "../components/WalletTab";
+import MpesaTab from "../components/MpesaTab";
 import { CATEGORIES, BOARDS, PRIORITIES, RECURRENCE_OPTIONS, REMINDER_CHANNELS, INITIAL_TASK_STATE } from "../constants/taskConstants";
 
 function Dashboard() {
@@ -571,7 +572,8 @@ function Dashboard() {
             { id: "kanban", label: "Board View", icon: "📊" },
             { id: "planner", label: "Planner", icon: "📅" },
             { id: "wallet", label: "Wallet", icon: "👛" },
-            { id: "analytics", label: "Analytics", icon: "📈" }
+            { id: "analytics", label: "Analytics", icon: "📈" },
+            { id: "mpesa", label: "Transactions", icon: "📱" }
           ].map(tab => (
             <button
               key={tab.id}
@@ -890,6 +892,7 @@ function Dashboard() {
   {activeDashboardTab === "wallet" && <WalletTab theme={theme} darkMode={darkMode} />}
 
   {activeDashboardTab === "analytics" && <AnalyticsTab darkMode={darkMode} />}
+  {activeDashboardTab === "mpesa" && <MpesaTab theme={theme} darkMode={darkMode} />}
   {activeDashboardTab === "kanban" && (
     <KanbanTab 
       tasks={tasks} 

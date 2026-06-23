@@ -17,7 +17,7 @@ router.post("/register", async (req, res) => {
   // console.log("🔥 REGISTER HIT:", req.body); // Removed for production readiness
 
   try {
-    const { username, password, country, currency } = req.body;
+    const { username, password, country, currency, email, phone } = req.body;
 
     if (!username || !password) {
       return res.status(400).json({ message: "Username and password required" });
@@ -31,8 +31,8 @@ router.post("/register", async (req, res) => {
       const userCurrency = currency || "KES";
 
       await dbAsync.run(
-        "INSERT INTO users (username, password, country, currency) VALUES (?, ?, ?, ?)",
-        [username, hashedPassword, userCountry, userCurrency]
+        "INSERT INTO users (username, password, country, currency, email, phone) VALUES (?, ?, ?, ?, ?, ?)",
+        [username, hashedPassword, userCountry, userCurrency, email || null, phone || null]
       );
       // console.log("✅ USER CREATED:", username); // Removed for production readiness
       return res.json({ message: "User registered successfully" });
@@ -97,7 +97,7 @@ router.post("/login", async (req, res) => {
 // =======================
 router.get("/profile", authMiddleware, async (req, res) => {
   try {
-    const user = await dbAsync.get("SELECT id, username, country, currency FROM users WHERE id = ?", [req.user.id]);
+    const user = await dbAsync.get("SELECT id, username, country, currency, email, phone FROM users WHERE id = ?", [req.user.id]);
     if (!user) return res.status(404).json({ message: "User not found" });
     res.json(user);
   } catch (err) {
@@ -111,9 +111,9 @@ router.get("/profile", authMiddleware, async (req, res) => {
 // =======================
 router.put("/profile", authMiddleware, async (req, res) => {
   try {
-    const { country, currency } = req.body;
-    await dbAsync.run("UPDATE users SET country = ?, currency = ? WHERE id = ?", [country, currency, req.user.id]);
-    const updated = await dbAsync.get("SELECT id, username, country, currency FROM users WHERE id = ?", [req.user.id]);
+    const { country, currency, email, phone } = req.body;
+    await dbAsync.run("UPDATE users SET country = ?, currency = ?, email = ?, phone = ? WHERE id = ?", [country, currency, email || null, phone || null, req.user.id]);
+    const updated = await dbAsync.get("SELECT id, username, country, currency, email, phone FROM users WHERE id = ?", [req.user.id]);
     res.json({ message: "Profile updated", profile: updated });
   } catch (err) {
     console.error("❌ PROFILE UPDATE ERROR:", err);

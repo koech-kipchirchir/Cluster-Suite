@@ -133,6 +133,9 @@ export const plannerApi = {
   getRecommendations: () => api.post("/planner/recommendations"),
   getEventAdvice: (id) => api.post(`/planner/${id}/ai-assist`),
   generatePlan: (prompt) => api.post("/planner/ai-generate-plan", { prompt }),
+  getMpesaRequests: () => api.get("/planner/mpesa-requests"),
+  depositManual: (id, data) => api.post(`/planner/wallets/${id}/deposit`, data),
+  withdraw: (id, data) => api.post(`/planner/wallets/${id}/withdraw`, data),
 };
 
 // ========================

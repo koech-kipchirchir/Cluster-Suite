@@ -1,16 +1,43 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import api from "../api";
+
+const countryToCurrency = {
+  Kenya: "KES",
+  Uganda: "UGX",
+  Tanzania: "TZS",
+};
+
+const localeToCountry = {
+  KE: "Kenya",
+  UG: "Uganda",
+  TZ: "Tanzania",
+};
 
 function Register() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [country, setCountry] = useState("Kenya");
+  const [currency, setCurrency] = useState("KES");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
   const navigate = useNavigate();
+
+  useEffect(() => {
+    try {
+      const locale = window.navigator.language?.split("-")[1]?.toUpperCase();
+      const autoCountry = localeToCountry[locale];
+      if (autoCountry) {
+        setCountry(autoCountry);
+        setCurrency(countryToCurrency[autoCountry]);
+      }
+    } catch (err) {
+      console.warn("Unable to auto-detect country", err);
+    }
+  }, []);
 
   const handleRegister = async (e) => {
     e.preventDefault();
@@ -37,6 +64,8 @@ function Register() {
       await api.post("/auth/register", {
         username: username.trim(),
         password,
+        country,
+        currency,
       });
 
       setSuccess("Account created successfully! Redirecting to login...");
@@ -162,6 +191,52 @@ function Register() {
               }}
               required
             />
+          </div>
+
+          <div style={{ marginBottom: "16px" }}>
+            <label htmlFor="country" style={{ display: "block", marginBottom: "6px", fontSize: "14px", fontWeight: "600", color: "#475569" }}>Country</label>
+            <select
+              id="country"
+              value={country}
+              onChange={(e) => {
+                const newCountry = e.target.value;
+                setCountry(newCountry);
+                setCurrency(countryToCurrency[newCountry] || "KES");
+              }}
+              style={{
+                width: "100%",
+                padding: "12px",
+                borderRadius: "8px",
+                border: "1px solid #e2e8f0",
+                fontSize: "14px",
+                boxSizing: "border-box"
+              }}
+            >
+              <option value="Kenya">Kenya (KES)</option>
+              <option value="Uganda">Uganda (UGX)</option>
+              <option value="Tanzania">Tanzania (TZS)</option>
+            </select>
+          </div>
+
+          <div style={{ marginBottom: "24px" }}>
+            <label htmlFor="currency" style={{ display: "block", marginBottom: "6px", fontSize: "14px", fontWeight: "600", color: "#475569" }}>Currency</label>
+            <select
+              id="currency"
+              value={currency}
+              onChange={(e) => setCurrency(e.target.value)}
+              style={{
+                width: "100%",
+                padding: "12px",
+                borderRadius: "8px",
+                border: "1px solid #e2e8f0",
+                fontSize: "14px",
+                boxSizing: "border-box"
+              }}
+            >
+              <option value="KES">KES</option>
+              <option value="UGX">UGX</option>
+              <option value="TZS">TZS</option>
+            </select>
           </div>
 
           <button
