@@ -26,5 +26,5 @@ jobs:
         with:
           repoToken: ${{ secrets.GITHUB_TOKEN }}
           firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CLUSTER_SUITE_APP_2026 }}
-          channelId: live
-          projectId: cluster-suite-a9e66
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
