@@ -16,5 +16,8 @@
     "start:backend": "npm start --workspace=backend",
     "build:frontend": "npm run build --workspace=frontend",
     "build": "npm run build:frontend"
+  },
+  "devDependencies": {
+    "firebase-tools": "^13.31.1"
   }
 }

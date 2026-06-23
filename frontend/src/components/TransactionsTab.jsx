@@ -9,7 +9,9 @@ const STATUS_CONFIG = {
 
 function formatCurrency(amount) {
   if (!amount && amount !== 0) return "—";
-  return "KES " + Number(amount).toLocaleString("en-KE", { minimumFractionDigits: 2 });
+  const absAmount = Math.abs(Number(amount));
+  const formatted = "KES " + absAmount.toLocaleString("en-KE", { minimumFractionDigits: 2 });
+  return Number(amount) < 0 ? `-${formatted}` : formatted;
 }
 
 function formatDate(dateStr) {
@@ -22,12 +24,26 @@ function formatDate(dateStr) {
 }
 
 function formatPhone(phone) {
-  if (!phone) return "—";
+  if (!phone) return "";
   const p = String(phone);
   if (p.startsWith("254") && p.length === 12) {
     return `+${p.slice(0, 3)} ${p.slice(3, 6)} ${p.slice(6, 9)} ${p.slice(9)}`;
   }
   return phone;
+}
+
+function formatMethod(method) {
+  if (!method) return "MANUAL";
+  const m = String(method).toLowerCase();
+  if (m === "mpesa") return "M-PESA";
+  if (m === "airtel_money" || m === "airtel") return "Airtel Money";
+  if (m === "t_kash" || m === "tkash") return "T-Kash";
+  if (m === "mtn") return "MTN MoMo";
+  if (m === "card") return "Debit/Credit Card";
+  if (m === "paypal") return "PayPal";
+  if (m === "bank") return "Bank Transfer";
+  if (m === "cash") return "Cash";
+  return method.charAt(0).toUpperCase() + method.slice(1);
 }
 
 function StatusBadge({ status, darkMode }) {
@@ -65,12 +81,13 @@ function StatCard({ label, value, icon, color, darkMode, theme }) {
   );
 }
 
-export default function MpesaTab({ theme, darkMode }) {
+export default function TransactionsTab({ theme, darkMode }) {
   const [transactions, setTransactions] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("All");
+  const [filterMethod, setFilterMethod] = useState("All");
   const [filterWallet, setFilterWallet] = useState("All");
   const [expandedId, setExpandedId] = useState(null);
 
@@ -78,10 +95,10 @@ export default function MpesaTab({ theme, darkMode }) {
     setLoading(true);
     setError("");
     try {
-      const res = await plannerApi.getMpesaRequests();
+      const res = await plannerApi.getTransactions();
       setTransactions(res.data || []);
     } catch (err) {
-      setError("Failed to load M-Pesa transaction history. Please try again.");
+      setError("Failed to load transaction history. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -91,14 +108,17 @@ export default function MpesaTab({ theme, darkMode }) {
 
   // Derived stats
   const totalDeposited = transactions
-    .filter(t => t.status === "completed")
+    .filter(t => t.status === "completed" && Number(t.amount) > 0)
     .reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+  const totalWithdrawn = transactions
+    .filter(t => t.status === "completed" && Number(t.amount) < 0)
+    .reduce((sum, t) => sum + Math.abs(parseFloat(t.amount) || 0), 0);
   const completedCount = transactions.filter(t => t.status === "completed").length;
   const pendingCount   = transactions.filter(t => t.status === "pending").length;
-  const failedCount    = transactions.filter(t => t.status === "failed").length;
 
-  // Unique wallets for filter
+  // Unique lists for filters
   const uniqueWallets = [...new Set(transactions.map(t => t.wallet_name).filter(Boolean))];
+  const uniqueMethods = [...new Set(transactions.map(t => t.method).filter(Boolean))];
 
   // Filtered list
   const filtered = transactions.filter(t => {
@@ -106,11 +126,14 @@ export default function MpesaTab({ theme, darkMode }) {
     const matchSearch = !q ||
       (t.phone || "").includes(q) ||
       (t.receipt || "").toLowerCase().includes(q) ||
+      (t.reference || "").toLowerCase().includes(q) ||
+      (t.method || "").toLowerCase().includes(q) ||
       (t.wallet_name || "").toLowerCase().includes(q) ||
       (t.merchant_request_id || "").toLowerCase().includes(q);
     const matchStatus = filterStatus === "All" || t.status === filterStatus;
+    const matchMethod = filterMethod === "All" || t.method === filterMethod;
     const matchWallet = filterWallet === "All" || t.wallet_name === filterWallet;
-    return matchSearch && matchStatus && matchWallet;
+    return matchSearch && matchStatus && matchMethod && matchWallet;
   });
 
   const inputStyle = {
@@ -127,10 +150,10 @@ export default function MpesaTab({ theme, darkMode }) {
       <div style={{ marginBottom: 24, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
         <div>
           <h2 style={{ margin: 0, fontSize: 26, fontWeight: 900, color: theme.text, display: "flex", alignItems: "center", gap: 10 }}>
-            📱 M-Pesa Transactions
+            💸 Transaction History
           </h2>
           <p style={{ margin: "6px 0 0", color: theme.muted, fontSize: 14 }}>
-            View all your Lipa na M-Pesa STK push requests and their statuses.
+            View deposits, withdrawals, and mobile money transactions across all your wallets.
           </p>
         </div>
         <button
@@ -154,10 +177,10 @@ export default function MpesaTab({ theme, darkMode }) {
       {/* Stats Row */}
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 28 }}>
         <StatCard label="Total Deposited" value={formatCurrency(totalDeposited)} icon="💰" color="#10b981" darkMode={darkMode} theme={theme} />
+        <StatCard label="Total Withdrawn" value={formatCurrency(totalWithdrawn)} icon="💸" color="#ef4444" darkMode={darkMode} theme={theme} />
         <StatCard label="Completed" value={completedCount} icon="✅" color="#10b981" darkMode={darkMode} theme={theme} />
         <StatCard label="Pending" value={pendingCount} icon="⏳" color="#f59e0b" darkMode={darkMode} theme={theme} />
-        <StatCard label="Failed" value={failedCount} icon="❌" color="#ef4444" darkMode={darkMode} theme={theme} />
-        <StatCard label="Total Requests" value={transactions.length} icon="📊" color="#6366f1" darkMode={darkMode} theme={theme} />
+        <StatCard label="Total Transactions" value={transactions.length} icon="📊" color="#6366f1" darkMode={darkMode} theme={theme} />
       </div>
 
       {/* Filters Row */}
@@ -169,7 +192,7 @@ export default function MpesaTab({ theme, darkMode }) {
       }}>
         <input
           style={{ ...inputStyle, flex: 1, minWidth: 200 }}
-          placeholder="🔍 Search by phone, receipt, wallet…"
+          placeholder="🔍 Search by phone, method, reference, receipt, wallet…"
           value={search}
           onChange={e => setSearch(e.target.value)}
         />
@@ -183,6 +206,16 @@ export default function MpesaTab({ theme, darkMode }) {
           <option value="pending">⏳ Pending</option>
           <option value="failed">❌ Failed</option>
         </select>
+        {uniqueMethods.length > 0 && (
+          <select
+            style={{ ...inputStyle, minWidth: 150 }}
+            value={filterMethod}
+            onChange={e => setFilterMethod(e.target.value)}
+          >
+            <option value="All">All Methods</option>
+            {uniqueMethods.map(m => <option key={m} value={m}>{formatMethod(m)}</option>)}
+          </select>
+        )}
         {uniqueWallets.length > 0 && (
           <select
             style={{ ...inputStyle, minWidth: 150 }}
@@ -193,9 +226,9 @@ export default function MpesaTab({ theme, darkMode }) {
             {uniqueWallets.map(w => <option key={w} value={w}>{w}</option>)}
           </select>
         )}
-        {(search || filterStatus !== "All" || filterWallet !== "All") && (
+        {(search || filterStatus !== "All" || filterMethod !== "All" || filterWallet !== "All") && (
           <button
-            onClick={() => { setSearch(""); setFilterStatus("All"); setFilterWallet("All"); }}
+            onClick={() => { setSearch(""); setFilterStatus("All"); setFilterMethod("All"); setFilterWallet("All"); }}
             style={{ ...inputStyle, background: "transparent", cursor: "pointer", color: "#ef4444", fontWeight: 700, border: "1px solid #ef444444" }}
           >
             ✕ Clear
@@ -241,7 +274,7 @@ export default function MpesaTab({ theme, darkMode }) {
           </div>
           <div style={{ color: theme.muted, maxWidth: 360, margin: "0 auto", fontSize: 14 }}>
             {transactions.length === 0
-              ? "Trigger an M-Pesa STK push from the Wallet tab to see your transaction history here."
+              ? "Trigger deposits or withdrawals from the Wallet tab to see your transaction history here."
               : "Try adjusting your search or filters to find what you're looking for."}
           </div>
         </div>
@@ -259,7 +292,7 @@ export default function MpesaTab({ theme, darkMode }) {
             letterSpacing: 1, color: theme.muted,
             borderRadius: 10, gap: 12,
           }}>
-            <span>Phone</span>
+            <span>Method / Detail</span>
             <span>Wallet</span>
             <span>Date</span>
             <span>Amount</span>
@@ -270,6 +303,7 @@ export default function MpesaTab({ theme, darkMode }) {
           {filtered.map((tx) => {
             const isExpanded = expandedId === tx.id;
             const cfg = STATUS_CONFIG[tx.status] || { color: "#6b7280" };
+            const isWithdrawal = Number(tx.amount) < 0;
             return (
               <div
                 key={tx.id}
@@ -298,10 +332,22 @@ export default function MpesaTab({ theme, darkMode }) {
                   onMouseLeave={e => e.currentTarget.style.background = "transparent"}
                 >
                   <div>
-                    <div style={{ fontWeight: 700, color: theme.text, fontSize: 14 }}>{formatPhone(tx.phone)}</div>
+                    <div style={{ fontWeight: 700, color: theme.text, fontSize: 14 }}>
+                      {isWithdrawal ? "📤 Withdrawal" : "📥 Deposit"}: {formatMethod(tx.method)}
+                    </div>
+                    {tx.phone && (
+                      <div style={{ fontSize: 11, color: theme.muted, marginTop: 2 }}>
+                        📞 {formatPhone(tx.phone)}
+                      </div>
+                    )}
                     {tx.receipt && (
                       <div style={{ fontSize: 11, color: "#10b981", fontWeight: 600, marginTop: 2 }}>
-                        🧾 {tx.receipt}
+                        🧾 Receipt: {tx.receipt}
+                      </div>
+                    )}
+                    {tx.reference && !tx.receipt && (
+                      <div style={{ fontSize: 11, color: "#6366f1", fontWeight: 600, marginTop: 2 }}>
+                        🔑 Ref: {tx.reference}
                       </div>
                     )}
                   </div>
@@ -309,7 +355,7 @@ export default function MpesaTab({ theme, darkMode }) {
                     {tx.wallet_name || <span style={{ opacity: 0.4 }}>—</span>}
                   </div>
                   <div style={{ color: theme.muted, fontSize: 13 }}>{formatDate(tx.created_at)}</div>
-                  <div style={{ fontWeight: 800, fontSize: 15, color: tx.status === "completed" ? "#10b981" : theme.text }}>
+                  <div style={{ fontWeight: 800, fontSize: 15, color: tx.status === "completed" ? (isWithdrawal ? "#ef4444" : "#10b981") : theme.text }}>
                     {formatCurrency(tx.amount)}
                   </div>
                   <StatusBadge status={tx.status} darkMode={darkMode} />
@@ -337,13 +383,14 @@ export default function MpesaTab({ theme, darkMode }) {
                         Transaction Details
                       </div>
                       {[
+                        ["Transaction Type", isWithdrawal ? "Withdrawal" : "Deposit"],
+                        ["Payment Method", formatMethod(tx.method)],
+                        ["Reference / Receipt", tx.receipt || tx.reference || "None"],
+                        ["Amount", formatCurrency(tx.amount)],
+                        ["Wallet ID / Name", `${tx.wallet_id || "—"} (${tx.wallet_name || "—"})`],
+                        ["Status", tx.status],
                         ["Merchant Request ID", tx.merchant_request_id || "—"],
                         ["Checkout Request ID", tx.checkout_request_id || "—"],
-                        ["Receipt", tx.receipt || "Not yet issued"],
-                        ["Phone", formatPhone(tx.phone)],
-                        ["Amount", formatCurrency(tx.amount)],
-                        ["Wallet", tx.wallet_name || "—"],
-                        ["Status", tx.status],
                         ["Created At", formatDate(tx.created_at)],
                         ["Updated At", formatDate(tx.updated_at)],
                       ].map(([label, val]) => (
@@ -354,10 +401,10 @@ export default function MpesaTab({ theme, darkMode }) {
                       ))}
                     </div>
 
-                    {/* Daraja Raw Response */}
+                    {/* Raw / Response Data */}
                     <div>
                       <div style={{ fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: 1, color: theme.muted, marginBottom: 12 }}>
-                        Raw Daraja Response
+                        Metadata / Raw Response
                       </div>
                       <pre style={{
                         background: darkMode ? "#0b0f1a" : "#f1f5f9",
@@ -370,7 +417,7 @@ export default function MpesaTab({ theme, darkMode }) {
                       }}>
                         {tx.daraja_response
                           ? (() => { try { return JSON.stringify(JSON.parse(tx.daraja_response), null, 2); } catch { return tx.daraja_response; } })()
-                          : "No response data"}
+                          : "No response metadata available"}
                       </pre>
                     </div>
                   </div>

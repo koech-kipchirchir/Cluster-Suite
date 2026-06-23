@@ -231,6 +231,15 @@ router.post('/wallets/:id/deposit', auth, async (req, res, next) => {
     if (wallet.event_id) {
       await dbAsync.run('UPDATE events SET current_savings=current_savings+?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?', [numericAmount, wallet.event_id, req.user.id]);
     }
+
+    // Log in general transactions table
+    const txId = `MAN_${Date.now()}`;
+    await dbAsync.run(
+      `INSERT INTO transactions (merchant_request_id, user_id, wallet_id, amount, phone, status, receipt, method, reference, daraja_response)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [txId, req.user.id, wallet.id, numericAmount, null, 'completed', reference || null, method || 'manual', reference || null, JSON.stringify({ manual: true })]
+    );
+
     const updated = await dbAsync.get('SELECT * FROM wallets WHERE id=?', [wallet.id]);
     res.json({ message: 'Deposit successful', wallet: updated });
   } catch (err) { next(err); }
@@ -273,6 +282,15 @@ router.post('/wallets/:id/withdraw', auth, async (req, res, next) => {
     if (wallet.event_id) {
       await dbAsync.run('UPDATE events SET current_savings=MAX(0,current_savings-?), updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?', [numericAmount, wallet.event_id, req.user.id]);
     }
+
+    // Log in general transactions table as negative amount (withdrawal)
+    const txId = `WD_${Date.now()}`;
+    await dbAsync.run(
+      `INSERT INTO transactions (merchant_request_id, user_id, wallet_id, amount, phone, status, receipt, method, reference, daraja_response)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [txId, req.user.id, wallet.id, -numericAmount, null, 'completed', reference || null, method || 'manual', reference || null, JSON.stringify({ withdrawal: true })]
+    );
+
     const updated = await dbAsync.get('SELECT * FROM wallets WHERE id=?', [wallet.id]);
     res.json({ message: 'Withdrawal successful', wallet: updated });
   } catch (err) { next(err); }
@@ -309,8 +327,8 @@ router.post('/wallets/:id/stk-push', auth, async (req, res, next) => {
 
       // Persist to DB
       await dbAsync.run(
-        'INSERT INTO mpesa_requests (merchant_request_id, user_id, wallet_id, amount, phone, status, receipt, daraja_response) VALUES (?,?,?,?,?,?,?,?)',
-        [fakeId, req.user.id, wallet.id, numericAmount, msisdn, 'completed', receipt, JSON.stringify({ dev: true })]
+        'INSERT INTO transactions (merchant_request_id, user_id, wallet_id, amount, phone, status, receipt, daraja_response, method) VALUES (?,?,?,?,?,?,?,?,?)',
+        [fakeId, req.user.id, wallet.id, numericAmount, msisdn, 'completed', receipt, JSON.stringify({ dev: true }), 'mpesa']
       );
 
       const newBalance = (parseFloat(wallet.balance) || 0) + numericAmount;
@@ -358,8 +376,8 @@ router.post('/wallets/:id/stk-push', auth, async (req, res, next) => {
 
     // Persist pending request
     await dbAsync.run(
-      'INSERT INTO mpesa_requests (merchant_request_id, checkout_request_id, user_id, wallet_id, amount, phone, status, daraja_response) VALUES (?,?,?,?,?,?,?,?)',
-      [response.data.MerchantRequestID || null, response.data.CheckoutRequestID || null, req.user.id, wallet.id, numericAmount, msisdn, 'pending', JSON.stringify(response.data)]
+      'INSERT INTO transactions (merchant_request_id, checkout_request_id, user_id, wallet_id, amount, phone, status, daraja_response, method) VALUES (?,?,?,?,?,?,?,?,?)',
+      [response.data.MerchantRequestID || null, response.data.CheckoutRequestID || null, req.user.id, wallet.id, numericAmount, msisdn, 'pending', JSON.stringify(response.data), 'mpesa']
     );
 
     mpesaRequests[merchantId || `RID_${Date.now()}`] = {
@@ -392,8 +410,8 @@ router.post('/mpesa-callback', async (req, res, next) => {
 
     // Find the persisted request
     let row = null;
-    if (merchantRequestID) row = await dbAsync.get('SELECT * FROM mpesa_requests WHERE merchant_request_id = ?', [merchantRequestID]);
-    if (!row && checkoutRequestID) row = await dbAsync.get('SELECT * FROM mpesa_requests WHERE checkout_request_id = ?', [checkoutRequestID]);
+    if (merchantRequestID) row = await dbAsync.get('SELECT * FROM transactions WHERE merchant_request_id = ?', [merchantRequestID]);
+    if (!row && checkoutRequestID) row = await dbAsync.get('SELECT * FROM transactions WHERE checkout_request_id = ?', [checkoutRequestID]);
 
     const darajaJson = JSON.stringify(stk);
 
@@ -408,9 +426,9 @@ router.post('/mpesa-callback', async (req, res, next) => {
         if (name.toLowerCase().includes('mpesareceiptnumber') || name.toLowerCase().includes('receipt')) receipt = it.Value || it.value;
       });
 
-      // Update mpesa_requests row
+      // Update transactions row
       if (row) {
-        await dbAsync.run('UPDATE mpesa_requests SET status=?, receipt=?, daraja_response=?, updated_at=CURRENT_TIMESTAMP WHERE id=?', ['completed', receipt || null, darajaJson, row.id]);
+        await dbAsync.run('UPDATE transactions SET status=?, receipt=?, daraja_response=?, updated_at=CURRENT_TIMESTAMP WHERE id=?', ['completed', receipt || null, darajaJson, row.id]);
 
         // Apply to wallet
         const wallet = await dbAsync.get('SELECT * FROM wallets WHERE id=?', [row.wallet_id]);
@@ -433,7 +451,7 @@ router.post('/mpesa-callback', async (req, res, next) => {
 
     // Non-zero result -> failed or canceled
     if (row) {
-      await dbAsync.run('UPDATE mpesa_requests SET status=?, daraja_response=?, updated_at=CURRENT_TIMESTAMP WHERE id=?', ['failed', darajaJson, row.id]);
+      await dbAsync.run('UPDATE transactions SET status=?, daraja_response=?, updated_at=CURRENT_TIMESTAMP WHERE id=?', ['failed', darajaJson, row.id]);
     }
 
     if (merchantRequestID) mpesaRequests[merchantRequestID] = { status: 'failed' };
@@ -446,15 +464,15 @@ router.post('/mpesa-callback', async (req, res, next) => {
   }
 });
 
-// GET mpesa-requests for user
-router.get('/mpesa-requests', auth, async (req, res, next) => {
+// GET transactions for user
+router.get('/transactions', auth, async (req, res, next) => {
   try {
     const rows = await dbAsync.all(
-      `SELECT mpesa_requests.*, wallets.name AS wallet_name
-       FROM mpesa_requests
-       LEFT JOIN wallets ON mpesa_requests.wallet_id = wallets.id
-       WHERE mpesa_requests.user_id = ?
-       ORDER BY mpesa_requests.created_at DESC`,
+      `SELECT transactions.*, wallets.name AS wallet_name
+       FROM transactions
+       LEFT JOIN wallets ON transactions.wallet_id = wallets.id
+       WHERE transactions.user_id = ?
+       ORDER BY transactions.created_at DESC`,
       [req.user.id]
     );
     res.json(rows);

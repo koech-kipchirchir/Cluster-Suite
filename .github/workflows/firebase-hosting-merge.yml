@@ -17,30 +17,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
 
-      - name: Install Root Dependencies
+      - name: Install Dependencies
         run: npm install
 
-      - name: Install Frontend Dependencies
-        run: |
-          cd frontend
-          npm install
-
-      - name: Verify Vite
-        run: |
-          cd frontend
-          npm list vite
-
       - name: Build Frontend
-        run: |
-          cd frontend
-          npm run build
-
-      - name: Install Firebase CLI
-        run: npm install -g firebase-tools
+        run: npm run build
 
       - name: Deploy to Firebase Hosting
         env:
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
-        run: |
-          firebase deploy --only hosting --project cluster-suite-app-2026
+        run: npx firebase deploy --only hosting --project cluster-suite-app-2026

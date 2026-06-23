@@ -133,27 +133,54 @@ db.run(`
 `);
 
 // =======================
-// MPESA REQUESTS TABLE
-// Tracks Daraja STK push requests and their completion state
+// TRANSACTIONS TABLE
+// Tracks deposits (M-Pesa, manual, card, etc.) and withdrawals
 // =======================
-db.run(`
-  CREATE TABLE IF NOT EXISTS mpesa_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    merchant_request_id TEXT,
-    checkout_request_id TEXT,
-    user_id INTEGER,
-    wallet_id INTEGER,
-    amount REAL,
-    phone TEXT,
-    status TEXT,
-    receipt TEXT,
-    daraja_response TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id),
-    FOREIGN KEY (wallet_id) REFERENCES wallets(id)
-  )
-`);
+db.serialize(() => {
+  // Check if old mpesa_requests table exists and rename it
+  db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='mpesa_requests'", (err, row) => {
+    if (row) {
+      db.run("ALTER TABLE mpesa_requests RENAME TO transactions", (renameErr) => {
+        if (!renameErr) {
+          console.log("Successfully renamed mpesa_requests table to transactions");
+          db.run("ALTER TABLE transactions ADD COLUMN method TEXT DEFAULT 'mpesa'", () => {});
+          db.run("ALTER TABLE transactions ADD COLUMN reference TEXT", () => {});
+        }
+      });
+    } else {
+      // Ensure columns exist on transactions table if already created
+      db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'", (tErr, tRow) => {
+        if (tRow) {
+          db.run("ALTER TABLE transactions ADD COLUMN method TEXT DEFAULT 'mpesa'", () => {});
+          db.run("ALTER TABLE transactions ADD COLUMN reference TEXT", () => {});
+        }
+      });
+    }
+  });
+
+  // Create transactions table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      merchant_request_id TEXT,
+      checkout_request_id TEXT,
+      user_id INTEGER,
+      wallet_id INTEGER,
+      amount REAL,
+      phone TEXT,
+      status TEXT,
+      receipt TEXT,
+      daraja_response TEXT,
+      method TEXT DEFAULT 'mpesa',
+      reference TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      FOREIGN KEY (wallet_id) REFERENCES wallets(id)
+    )
+  `);
+});
+
 
 // =======================
 // EVENT TEMPLATES TABLE (NEW)
