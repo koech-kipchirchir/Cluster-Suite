@@ -13,8 +13,9 @@ jobs:
         with:
           node-version: 22
           cache: "npm"
-      - name: Install All Dependencies
-        run: npm ci
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install Frontend Dependencies
+        run: npm ci --prefix frontend
       - name: Build Frontend Application
         run: npm run build
       - name: Deploy to Live Production Site
