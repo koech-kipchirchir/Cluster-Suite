@@ -1,4 +1,4 @@
-name: Deploy to Firebase Hosting on merge
+name: Deploy to Firebase Hosting
 on:
   push:
     branches:
@@ -21,10 +21,12 @@ jobs:
       - name: Build Frontend Application
         run: npm run build
 
-      - name: Deploy to Firebase Hosting
+      - name: Deploy to Live Production Site
         uses: FirebaseExtended/action-hosting-deploy@v0
         with:
           repoToken: ${{ secrets.GITHUB_TOKEN }}
           firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CLUSTER_SUITE_APP_2026 }}
+          channelId: live
+          projectId: cluster-suite-app-2026
         env:
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
