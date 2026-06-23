@@ -17,23 +17,29 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
-      - name: Install All Dependencies
+      - name: Install Root Dependencies
         run: npm install
 
-      - name: Verify Workspace Dependencies
-        run: npm list vite
+      - name: Install Frontend Dependencies
+        run: |
+          cd frontend
+          npm install
 
-      - name: Build Frontend Application
-        run: npm run build
+      - name: Verify Vite
+        run: |
+          cd frontend
+          npm list vite
 
-      - name: Deploy to Live Production Site
+      - name: Build Frontend
+        run: |
+          cd frontend
+          npm run build
+
+      - name: Deploy to Firebase Hosting
         uses: FirebaseExtended/action-hosting-deploy@v0
         with:
           repoToken: ${{ secrets.GITHUB_TOKEN }}
           firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CLUSTER_SUITE_APP_2026 }}
           channelId: live
           projectId: cluster-suite-app-2026
-        env:
-          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
